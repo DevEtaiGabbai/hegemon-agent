@@ -411,6 +411,52 @@ def t_ai_outcomes():
             assert "not the dataset" in out
 
 
+def t_local_mode():
+    """local mode: no OpenAI key, chat-completions to the local address, <think> stripped, a cut-off prompt
+    is warned about; mixed sends only ranking/file picking local; cloud is unchanged."""
+    good = (HERE / "fixture_geo_convert.py").read_text()
+    broken = good.replace('gse.gpls[platform]', 'gse.gpls["GPL000"]')
+    ai = _mock([{"text": "<think>hmm</think>" + _reply(broken)}, {"text": _reply(good), "prompt_tokens": 999999}])
+    try:
+        rc, out = cli("build", "GSE999001", "--source", str(T / "fixtures" / "geo"), "--no-publish",
+                      HEGEMON_BUILTIN="0", HEGEMON_MODE="local", OPENAI_API_KEY="",
+                      HEGEMON_LOCAL_URL="http://127.0.0.1:8799/v1", HEGEMON_LOCAL_MODEL="tiny-16k",
+                      HOME=str(T / "home-local"))
+    finally:
+        stop(ai)
+    assert rc == 0, out[-2000:]
+    calls = [json.loads(l) for l in (T / "ai-log.jsonl").read_text().splitlines()]
+    assert len(calls) == 2 and all(c["path"] == "/v1/chat/completions" for c in calls), calls
+    assert all(c["auth"] == "" and "reasoning" not in c["body"] and c["body"]["model"] == "tiny-16k" for c in calls)
+    assert calls[0]["body"]["messages"][0]["role"] == "system" and "GSM900003" in calls[0]["body"]["messages"][1]["content"]
+    assert "WHAT WENT WRONG" in calls[1]["body"]["messages"][1]["content"]
+    assert out.count("context window cut the prompt short") == 1, out    # first call only (1000 of ~many tokens)
+    receipt = json.loads((last_build("GSE999001-*") / "build.json").read_text())
+    assert receipt["model"] == "tiny-16k" and receipt["ai_calls"] == 2
+
+    # the local model is down -> an AI-provider stop naming the tunnel, never a dataset failure
+    rc, out = cli("build", "GSE999001", "--source", str(T / "fixtures" / "geo"), "--no-publish",
+                  HEGEMON_BUILTIN="0", HEGEMON_MODE="local", HEGEMON_LOCAL_URL="http://127.0.0.1:9/v1",
+                  HOME=str(T / "home-local"))
+    assert rc == 2 and "AI_PROVIDER_NETWORK" in out and "ssh -R 11434" in out and "not the dataset" in out, out[-1500:]
+
+    sys.path.insert(0, str(AGENT))
+    from hegemon_nb.config import Config
+    old = dict(os.environ)
+    try:
+        os.environ.update(HEGEMON_LOCAL_MODEL="tiny-16k", HOME=str(T / "home-local"))
+        for mode, conv, fast in (("mixed", False, True), ("local", True, True), ("cloud", False, False)):
+            os.environ["HEGEMON_MODE"] = mode
+            c = Config()
+            assert (c.is_local(c.model), c.is_local(c.fast_model)) == (conv, fast), mode
+        os.environ.pop("HEGEMON_MODE")
+        c = Config()
+        assert c.mode is None and c.model == "gpt-5.6-sol" and not c.is_local(c.fast_model)
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
+
 def t_ae_build_vs_notebook():
     rc, out = cli("build", "E-MTAB-9999", "--source", str(T / "fixtures" / "ae"),
                   "--script", str(HERE / "fixture_ae_convert.py"), "--no-publish")
@@ -703,12 +749,13 @@ def t_batch_shared_key():
     assert (site / "index.html").read_text().count("explore.php?key=tregcd") == 1
     state = json.loads((T / "runs" / "batches" / "tregcd.json").read_text())
     assert state["query"] == "regulatory T cells" and state["tried"]["GSE999002"]["status"] == "DOWNLOAD_FAILED"
-    # second run with the same key: skips what is published, reuses the saved query
+    # second run with the same key: skips what is published, reuses the saved query, and --retry-failed gives
+    # the dataset that failed another try (it fails again; the two that are published still fill the page)
     ai = _mock([{"text": "Rank\n" + json.dumps({"ranked": [{"accession": "GSE999002", "why": "retry"}]})}] +
                [{"text": reply}] * 4)
     php = start(["php", "-S", "127.0.0.1:8765", "-t", str(site)], 8765)
     try:
-        p2 = subprocess.run([PY, str(runner), "batch", "--key", "tregcd", "--count", "1", "--retry-failed",
+        p2 = subprocess.run([PY, str(runner), "batch", "--key", "tregcd", "--count", "2", "--retry-failed",
                              "--min-samples", "0"],
                             env=env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             universal_newlines=True, timeout=900)
@@ -716,6 +763,569 @@ def t_batch_shared_key():
         stop(ai)
         stop(php)
     assert "2 dataset(s) already published under 'tregcd': GSE999001, GSE999003" in p2.stdout, p2.stdout[-2500:]
+    assert "Batch 'tregcd': 2 dataset(s) for: regulatory T cells" in p2.stdout, p2.stdout[:600]
+    assert "[1/1] GSE999002" in p2.stdout and "simulated download failure" in p2.stdout, p2.stdout[-2500:]
+    assert p2.returncode == 0, p2.stdout[-2500:]
+    assert (site / "explore.conf").read_text().count("key= tregcd") == 2
+
+
+def _batch_world(name):
+    """A stand-in GEO for batch tests. Which studies the search returns, and which of them fail to download, are
+    read from a control file on every call, so a test can change the world between two runs of the agent.
+
+    Returns go(search, ai_order, *cli_args, fail=(), typed=None, ai_down=False) -> (exit code, output, AI ranking
+    calls made). ai_order is what the mock AI ranks if it is asked; a study left out of it was "shown and left out".
+    """
+    control, runner = T / (name + "_world.json"), T / (name + "_runner.py")
+    runner.write_text(
+        "import sys, json, pathlib, shutil; sys.path.insert(0, {agent!r})\n"
+        "from hegemon_nb import repos\n"
+        "def world():\n"
+        "    return json.loads(pathlib.Path({control!r}).read_text())\n"
+        "def fake(query, limit=40):\n"
+        "    return [repos.Dataset(a, 'GEO', a + ' study', kind='Expression profiling by array')\n"
+        "            for a in world()['search']]\n"
+        "repos.search_geo = fake\n"
+        "repos.search_arrayexpress = lambda q, limit=40: []\n"
+        "def fetch(ds, source, cfg, yes=False, **kw):\n"
+        "    if ds.accession in world()['fail']:\n"
+        "        raise repos.net.NetError('simulated download failure')\n"
+        "    source = pathlib.Path(source); source.mkdir(parents=True, exist_ok=True)\n"
+        "    soft = source / (ds.accession + '_family.soft.gz')\n"
+        "    shutil.copy({src!r} + '/GSE999001_family.soft.gz', str(soft))\n"
+        "    return soft, repos.read_geo_soft(soft, tables=False), [], ['soft tables']\n"
+        "repos.fetch_geo = fetch\n"
+        "import hegemon\n"
+        "sys.exit(hegemon.main(sys.argv[1:]))\n".format(agent=str(AGENT), control=str(control),
+                                                         src=str(T / "fixtures" / "geo")))
+    good = (HERE / "fixture_geo_convert.py").read_text()
+
+    def go(search, ai_order, *args, **options):
+        control.write_text(json.dumps({"search": list(search), "fail": list(options.get("fail", ()))}))
+        ranking = {"text": "Rank\n" + json.dumps({"ranked": [{"accession": a, "why": "why " + a} for a in ai_order],
+                                                  "genes": ["ACTB", "GAPDH"]})}
+        if options.get("ai_down"):
+            ranking = {"status": 401, "error": {"message": "Incorrect API key", "code": "invalid_api_key"}}
+        ai = _mock([ranking] + [{"text": "Source: GSM VALUE tables.\n```python\n" + good + "\n```"}] * 4)
+        try:
+            typed = options.get("typed")
+            p = subprocess.run([PY, str(runner)] + list(args), env=env(), input=typed,
+                               stdin=None if typed is not None else subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, universal_newlines=True, timeout=900)
+        finally:
+            stop(ai)
+        asked = [json.loads(line)["body"]["instructions"] for line in (T / "ai-log.jsonl").read_text().splitlines()]
+        return p.returncode, p.stdout, sum(1 for text in asked if text.startswith("You rank"))
+    return go
+
+
+def t_batch_rerun():
+    """Asking for the same thing again adds only what is new in the best N. What is already on the page is skipped,
+    the ranking a search got is remembered so the AI cannot reshuffle a page, a study the search has not returned
+    before is slotted in where the AI ranks it, and --more goes further down the ranking."""
+    sys.path.insert(0, str(AGENT))
+    import hegemon
+    from hegemon_nb import publish
+    # the pieces on their own
+    assert hegemon.search_id("  Ulcerative   COLITIS ") == "ulcerative colitis"
+    assert hegemon.search_id("crohn disease") != hegemon.search_id("ulcerative colitis")
+    for one, other in (("ER+ breast cancer", "ER- breast cancer"), ("CD4+ T cells", "CD4- T cells"),
+                       (u"TGF-β fibrosis", u"TGF-α fibrosis")):
+        assert hegemon.search_id(one) != hegemon.search_id(other), "two different questions counted as one: " + one
+    assert hegemon.slot_in([], ["A", "B"]) == ["A", "B"]
+    assert hegemon.slot_in(["C", "B", "A"], ["A", "B", "C"]) == ["C", "B", "A"], "a study ranked before moved"
+    assert hegemon.slot_in(["A", "B", "C", "D"], ["B", "N", "A", "D", "C"]) == ["A", "N", "B", "C", "D"]
+    assert hegemon.slot_in(["A", "B"], ["N1", "B", "N2", "A", "N3"]) == ["N1", "A", "N2", "B", "N3"]
+    assert hegemon.slot_in(["A", "GONE", "B"], ["B", "A", "N"]) == ["A", "GONE", "B", "N"]
+    assert hegemon.slot_in(["GONE", "A", "B"], ["N", "B", "A"]) == ["GONE", "N", "A", "B"]
+    # a new study the AI was shown and left out has no rank: it goes last, wherever the repository lists it
+    assert hegemon.slot_in(["A", "B", "C"], ["A", "N", "X", "B", "C"], ["A", "N"]) == ["A", "N", "B", "C", "X"]
+    assert hegemon.slot_in(["A", "B"], ["A", "X", "Y", "B"], ["A"]) == ["A", "B", "X", "Y"]
+    outcomes = {"A": {"status": "published"}, "B": {"status": "DOWNLOAD_FAILED"}, "C": {"status": "NO_PROCESSED_DATA"},
+                "D": {"status": "AI_PROVIDER_QUOTA"}, "F": None}
+    assert [hegemon.failed_before(outcomes, a) for a in "ABCDEF"] == [None, "DOWNLOAD_FAILED", "NO_PROCESSED_DATA",
+                                                                       None, None, None]
+    # a limit that turned a dataset away: left alone while the limit stands, tried again once it lets more through
+    turned_away = {"M": {"status": "TOO_MANY_SAMPLES", "limit": 250}, "F": {"status": "TOO_FEW_SAMPLES", "limit": 20},
+                   "L": {"status": "FILES_TOO_LARGE", "limit": [5.0, 20.0, False]},
+                   "O": {"status": "TOO_MANY_SAMPLES"}}     # O: from a record that did not keep the limit
+    same = {"min_samples": 20, "max_samples": 250, "size": [5.0, 20.0, False]}
+    looser = {"min_samples": 10, "max_samples": 0, "size": [5.0, 20.0, True]}
+    tighter = {"min_samples": 30, "max_samples": 100, "size": [1.0, 20.0, False]}
+    names = ["TOO_MANY_SAMPLES", "TOO_FEW_SAMPLES", "FILES_TOO_LARGE", "TOO_MANY_SAMPLES"]
+    assert [hegemon.failed_before(turned_away, a, same) for a in "MFLO"] == names
+    assert [hegemon.failed_before(turned_away, a, tighter) for a in "MFLO"] == names
+    assert [hegemon.failed_before(turned_away, a, looser) for a in "MFLO"] == [None, None, None, "TOO_MANY_SAMPLES"]
+    assert hegemon.failed_before(turned_away, "M", dict(same, max_samples=500)) is None
+    assert hegemon.failed_before(turned_away, "L", dict(same, size=[5.0, 40.0, False])) is None
+
+    site = php_site()
+    go = _batch_world("rerun")
+    g = ["GSE9991{:02d}".format(n) for n in range(0, 10)]   # g[1] .. g[9]
+    conf, index = site / "explore.conf", site / "index.html"
+    record = T / "runs" / "batches" / "rerun.json"
+
+    def on_page(key="rerun"):
+        return {v["source"] for v in publish._sections(conf.read_text()).values() if v.get("key") == key}
+
+    def remembered(search="ulcerative colitis", key="rerun"):
+        return json.loads((T / "runs" / "batches" / (key + ".json")).read_text())["rankings"][search]["order"]
+
+    base = ["--key", "rerun", "--count", "3", "--min-samples", "0"]
+    php = start(["php", "-S", "127.0.0.1:8765", "-t", str(site)], 8765)
+    try:
+        # 1. the first time: the best 3 that can be built. g2 fails to download, so the 4th takes its place.
+        rc, out, ranked = go(g[1:7], g[1:7], "batch", "ulcerative colitis", *base, fail=[g[2]])
+        assert rc == 0 and ranked == 1, out[-3000:]
+        assert "6 ranked candidates, 6 to try" in out, out[:2500]
+        assert on_page() == {g[1], g[3], g[4]}, on_page()
+        assert "3 dataset(s) are now on one page under key 'rerun'" in out, out[-1500:]
+        assert "Ask for the same thing again and only what is new in the best 3 is added." in out, out[-1500:]
+        assert "For the next 3 down the ranking: hegemon batch --key rerun --more --count 3\n" in out, out[-1500:]
+        assert remembered() == g[1:7], remembered()
+        tried = json.loads(record.read_text())["tried"]
+        assert all(v["search"] == "ulcerative colitis" for v in tried.values()), tried
+
+        # 2. the same thing again (capitals differ): nothing is built, the AI is not even asked, and it says so.
+        #    The AI would now rank g6 and g5 first; a ranking that is remembered cannot be reshuffled.
+        before = (conf.read_bytes(), index.read_bytes())
+        rc, out, ranked = go(g[1:7], [g[6], g[5], g[1], g[2], g[3], g[4]], "batch", "Ulcerative Colitis", *base,
+                             fail=[g[2]])
+        assert rc == 0 and ranked == 0, (rc, ranked, out[-3000:])
+        assert (T / "ai-log.jsonl").read_text() == "", "the AI was called on a run with nothing new"
+        assert (conf.read_bytes(), index.read_bytes()) == before, "a run with nothing new changed the site"
+        for line in ("3 dataset(s) already published under 'rerun': {}, {}, {}".format(g[1], g[3], g[4]),
+                     "Those are skipped. This run adds only what is new in the best 3 for this search.",
+                     "every study this search returned was already ranked (",
+                     "the best 3 for this search: 3 already on your page, 0 to add",
+                     "Nothing new for 'rerun'",
+                     'The best 3 datasets for "Ulcerative Colitis" are already on your page. Nothing was added.',
+                     "1 that did not publish before was left alone: {} (DOWNLOAD_FAILED)".format(g[2]),
+                     "To try it again: hegemon batch --key rerun --count 3 --retry-failed\n",
+                     "For the next 3 down the ranking: hegemon batch --key rerun --more --count 3\n",
+                     "Your page (3 datasets): http://127.0.0.1:8765/explore.php?key=rerun"):
+            assert line in out, (line, out[-3000:])
+        assert "[1/" not in out and "Downloading" not in out, out[-3000:]
+
+        # 3. a study the search has not returned before (g7), which the AI ranks 2nd: it is built. The AI also
+        #    moved g5 and g6 up this time; they were ranked before, so they stay where they were and are not built.
+        rc, out, ranked = go([g[7]] + g[1:7], [g[5], g[7], g[6], g[1], g[2], g[3], g[4]], "batch",
+                             "ulcerative colitis", *base, fail=[g[2]])
+        assert rc == 0 and ranked == 1, (rc, ranked, out[-3000:])
+        assert on_page() == {g[1], g[3], g[4], g[7]}, on_page()
+        assert remembered() == [g[1], g[7], g[2], g[3], g[4], g[5], g[6]], remembered()
+        for line in ("1 study is new to this search since",
+                     "The AI ranked it among the 7 it was shown: {} (#2).".format(g[7]),
+                     "the best 3 for this search: 2 already on your page, 1 to add: " + g[7],
+                     "[1/1] " + g[7], "ranked because: why " + g[7], "1 of 1 published under 'rerun'",
+                     "skipping {} (DOWNLOAD_FAILED last time; --retry-failed to try again)".format(g[2]),
+                     "4 dataset(s) are now on one page under key 'rerun'"):
+            assert line in out, (line, out[-3500:])
+
+        # 4. --more: the next one down the remembered ranking, without asking the AI
+        world = [g[7]] + g[1:7]
+        rc, out, ranked = go(world, [g[6], g[5]], "batch", "ulcerative colitis", "--key", "rerun", "--count", "1",
+                             "--more", "--min-samples", "0", fail=[g[2]])
+        assert rc == 0 and ranked == 0, (rc, ranked, out[-3000:])
+        assert on_page() == {g[1], g[3], g[4], g[7], g[5]}, on_page()
+        assert "This run adds 1 more and skips those." in out, out[:1500]
+        assert "the next 1 down the ranking: " + g[5] in out, out[:2500]
+        assert "For the 1 after these: hegemon batch --key rerun --more --count 1\n" in out, out[-1500:]
+
+        # 5. --retry-failed: g2 downloads now, and it ranks in the best 3, so it joins the page
+        rc, out, ranked = go(world, [g[6]], "batch", "ulcerative colitis", *(base + ["--retry-failed"]))
+        assert rc == 0 and ranked == 0, (rc, ranked, out[-3000:])
+        assert on_page() == {g[1], g[2], g[3], g[4], g[5], g[7]}, on_page()
+        assert "the best 3 for this search: 2 already on your page, 1 to add: " + g[2] in out, out[:2500]
+
+        # 6. the search stops returning g1, g4, g5 and g7. They are on the page and were ranked in the best 3,
+        #    so they still hold their places: g6, the only study left to build, is not built to "fill" them.
+        before = conf.read_bytes()
+        rc, out, ranked = go([g[2], g[3], g[6]], [g[6]], "batch", "ulcerative colitis", *base)
+        assert rc == 0 and ranked == 0 and conf.read_bytes() == before, (rc, ranked, out[-3000:])
+        assert "are already on your page. Nothing was added." in out, out[-2000:]
+
+        # 7. --rerank: forget the ranking; the AI's order today decides. It puts g6 first, so g6 is built.
+        rc, out, ranked = go(world, [g[6], g[1], g[7], g[2], g[3], g[4], g[5]], "batch", "ulcerative colitis",
+                             *(base + ["--rerank"]))
+        assert rc == 0 and ranked == 1, (rc, ranked, out[-3000:])
+        assert on_page() == set(g[1:8]), on_page()
+        assert "[1/1] " + g[6] in out, out[-3000:]
+        assert remembered() == [g[6], g[1], g[7], g[2], g[3], g[4], g[5]], remembered()
+
+        # 8. a batch record written by version 1.0 (the pages already on the server): no ranking, and no note of
+        #    which search tried what. The order its datasets were tried in is kept, so the first run with this
+        #    version builds nothing, whatever the AI says today. It would rank g8 first.
+        state = json.loads(record.read_text())
+        assert list(state["tried"]) == [g[1], g[2], g[3], g[4], g[7], g[5], g[6]], list(state["tried"])
+        del state["rankings"]
+        for entry in state["tried"].values():
+            del entry["search"]
+        record.write_text(json.dumps(state))
+        before = conf.read_bytes()
+        rc, out, ranked = go([g[8]] + world, [g[8], g[7], g[6], g[5], g[4], g[3], g[2], g[1]], "batch",
+                             "ulcerative colitis", *base)
+        assert rc == 0 and ranked == 1 and conf.read_bytes() == before, (rc, ranked, out[-3000:])
+        assert "the datasets this search already tried keep the order they were tried in" in out, out[:2500]
+        assert 'The best 3 datasets for "ulcerative colitis" are already on your page.' in out, out[-2000:]
+        assert remembered() == [g[1], g[2], g[3], g[4], g[7], g[5], g[6], g[8]], remembered()
+        #    and from then on it is remembered: the same thing again does not ask the AI
+        rc, out, ranked = go([g[8]] + world, [g[8]], "batch", "ulcerative colitis", *base)
+        assert rc == 0 and ranked == 0 and conf.read_bytes() == before, (rc, ranked, out[-3000:])
+
+        # 9. another search on the same page is ranked on its own: its best study (g8) is not there yet
+        rc, out, ranked = go([g[8]] + world, [g[8], g[1]], "batch", "crohn disease", "--key", "rerun", "--count", "1",
+                             "--min-samples", "0")
+        assert rc == 0 and ranked == 1, (rc, ranked, out[-3000:])
+        assert on_page() == set(g[1:9]), on_page()
+        assert "the best 1 for this search: 0 already on your page, 1 to add: " + g[8] in out, out[:2500]
+        assert remembered("crohn disease")[0] == g[8] and remembered()[0] == g[1]
+        assert index.read_text().count("explore.php?key=rerun") == 1, "one homepage link per key"
+
+        # 10. a new study (g9) that the AI is shown and leaves out of its ranking. The repository lists it first,
+        #     but that is not a rank: it goes last and is not built, and the output does not call it ranked.
+        before = conf.read_bytes()
+        rc, out, ranked = go([g[9], g[8]] + world, [g[1]], "batch", "ulcerative colitis", *base)
+        assert rc == 0 and ranked == 1 and conf.read_bytes() == before, (rc, ranked, out[-3000:])
+        assert remembered() == [g[1], g[2], g[3], g[4], g[7], g[5], g[6], g[8], g[9]], remembered()
+        assert "The AI left it out of its ranking, so it goes last: {}.".format(g[9]) in out, out[:2500]
+        assert "The AI ranked" not in out and "Nothing was added." in out, out[-2500:]
+
+        # 11. two searches on one page, and a run when the AI cannot be reached. That run uses repository order
+        #     and remembers nothing from it. When the AI answers again, what THIS search already tried keeps its
+        #     place; the datasets the other search put on the page are not mixed into its ranking.
+        go2 = _batch_world("rerun2")
+        h = ["GSE9992{:02d}".format(n) for n in range(0, 7)]
+        args2 = ["--key", "rerun2", "--count", "2", "--min-samples", "0"]
+        rc, out, ranked = go2(h[1:3], h[1:3], "batch", "crohn disease", *args2)
+        assert rc == 0 and on_page("rerun2") == {h[1], h[2]}, (rc, out[-3000:])
+        rc, out, ranked = go2(h[3:7], [], "batch", "ulcerative colitis", *args2, ai_down=True)
+        assert rc == 0 and "ranking skipped" in out and on_page("rerun2") == set(h[1:5]), (rc, out[-3000:])
+        assert list(json.loads((T / "runs" / "batches" / "rerun2.json").read_text())["rankings"]) == ["crohn disease"]
+        before = conf.read_bytes()
+        rc, out, ranked = go2(h[3:7], [h[6], h[5], h[4], h[3]], "batch", "ulcerative colitis", *args2)
+        assert rc == 0 and ranked == 1 and conf.read_bytes() == before, (rc, ranked, out[-3000:])
+        assert remembered("ulcerative colitis", "rerun2") == [h[3], h[4], h[6], h[5]], remembered("ulcerative colitis", "rerun2")
+        assert 'The best 2 datasets for "ulcerative colitis" are already on your page.' in out, out[-2000:]
+        rc, out, ranked = go2(h[1:3], [h[2], h[1]], "batch", "crohn disease", *args2)
+        assert rc == 0 and ranked == 0 and conf.read_bytes() == before, (rc, ranked, out[-3000:])
+
+        # 12. a limit turns datasets away (6 samples, --max-samples 5). They are left alone while the limit
+        #     stands, and tried again, without --retry-failed, once the limit is lifted.
+        go3 = _batch_world("limits")
+        k = ["GSE9993{:02d}".format(n) for n in range(0, 3)]
+        args3 = ["batch", "big cohorts", "--key", "limits", "--count", "1", "--min-samples", "0"]
+        rc, out, ranked = go3(k[1:3], k[1:3], *(args3 + ["--max-samples", "5"]))
+        assert rc == 1 and out.count("TOO_MANY_SAMPLES") >= 2 and on_page("limits") == set(), (rc, out[-3000:])
+        tried = json.loads((T / "runs" / "batches" / "limits.json").read_text())["tried"]
+        assert [(a, v["status"], v["limit"]) for a, v in tried.items()] == [(k[1], "TOO_MANY_SAMPLES", 5),
+                                                                           (k[2], "TOO_MANY_SAMPLES", 5)], tried
+        rc, out, ranked = go3(k[1:3], k[1:3], *(args3 + ["--max-samples", "5"]))
+        assert rc == 1 and ranked == 0 and "Downloading" not in out, (rc, ranked, out[-3000:])
+        assert "2 that did not publish before were left alone: {} (TOO_MANY_SAMPLES), {} (TOO_MANY_SAMPLES)".format(
+            k[1], k[2]) in out, out[-2500:]
+        assert "To try them again: hegemon batch --key limits --count 1 --retry-failed" in out, out[-2500:]
+        rc, out, ranked = go3(k[1:3], k[1:3], *(args3 + ["--max-samples", "0"]))
+        assert rc == 0 and ranked == 0 and on_page("limits") == {k[1]}, (rc, ranked, out[-3000:])
+
+        # 13. the commands printed for "what next" repeat this request: an agent page with its own key keeps it
+        go4 = _batch_world("hints")
+        m = ["GSE9994{:02d}".format(n) for n in range(0, 3)]
+        rc, out, ranked = go4(m[1:3], m[1:3], "agent", "--key", "mypage", "--count", "1", "--min-samples", "0",
+                              typed="some topic\n")
+        assert rc == 0 and on_page("mypage") == {m[1]}, (rc, out[-3000:])
+        assert "For the next 1 down the ranking: hegemon agent --key mypage --more --count 1\n" in out, out[-1500:]
+        # 14. --count 0 is refused before anything is searched
+        rc, out, ranked = go4(m[1:3], m[1:3], "batch", "some topic", "--key", "mypage", "--count", "0")
+        assert rc != 0 and "--count must be 1 or more" in out and "Searching" not in out, (rc, out)
+        assert not list((T / "runs" / "batches").glob("*.tmp")), "a half-written batch record was left behind"
+        # 15. a batch record that cannot be read: one plain sentence instead of a traceback, and nothing is touched
+        damaged = T / "runs" / "batches" / "mypage.json"
+        whole = damaged.read_text()
+        damaged.write_text(whole[:len(whole) // 2])
+        rc, out, ranked = go4(m[1:3], m[1:3], "batch", "some topic", "--key", "mypage", "--count", "1")
+        assert rc != 0 and "cannot be read" in out and "Traceback" not in out and "Searching" not in out, (rc, out)
+        assert damaged.read_text() == whole[:len(whole) // 2]
+        damaged.write_text(whole)
+    finally:
+        stop(php)
+
+
+def _rerun_rules(memories, tried, published, sid, search, broken, picks, n, more, retry, rerank):
+    """The rerun rules stated a second time, on purpose not the way hegemon.py writes them, for the random test.
+
+    memories: search -> the ranking remembered for it. tried: accession -> (outcome, the search that tried it), in
+    the order tried. picks: what the AI's reply ranks today, in its order (None when it cannot be reached).
+    Returns (datasets built in order, AI calls made, published datasets that took a place) and updates both.
+    """
+    pool = search[:max(60, n * 6)]
+    listed = []                                          # what the AI really ranked, of what it was shown
+    for a in (picks or []) if len(search) > 1 else []:   # (a search with one study is not sent to the AI)
+        if a in pool and a not in listed:
+            listed.append(a)
+    rest = [a for a in pool if a not in listed]          # shown and left out, as the repository lists them
+    memory = memories.get(sid)
+    mine = [a for a, (_outcome, by) in tried.items() if by == sid]
+    base, from_history = (memory, False) if memory else (mine, bool(mine))
+    unseen = [a for a in pool if a not in base]
+    needs_ai = rerank or from_history or bool(unseen)
+    if not needs_ai:
+        order = list(base)
+    elif listed and rerank:                              # --rerank: the AI's order today, nothing else
+        order = listed + rest
+    elif not listed or from_history:                     # no ranking today, or a history without a ranking
+        order = base + [a for a in listed + rest if a not in base]
+    else:
+        fresh_new = [a for a in listed if a not in base]                 # new, and ranked by the AI today
+        outcasts = [a for a in rest if a not in base]                    # new, and left out by the AI: no rank
+        gaps = iter([a for a in base if a in pool])
+        # today's list: a new study sits where the AI put it, the others fill the gaps in remembered order
+        today = [a if a in fresh_new else next(gaps) for a in listed + rest if a not in outcasts]
+        # the studies the search no longer returns stay where they were among the remembered ones
+        ahead, waiting = {}, []
+        for a in today:
+            if a in fresh_new:
+                waiting.append(a)
+            else:
+                ahead[a], waiting = waiting, []
+        order = []
+        for a in base:
+            order += ahead.get(a, []) + [a]
+        order += waiting + outcasts
+    if needs_ai and listed:
+        memories[sid] = order
+
+    def failed(a):
+        outcome = tried.get(a, (None, None))[0]
+        return outcome not in (None, "published") and not outcome.startswith("AI_PROVIDER_")
+
+    built, places, kept, there = [], 0, 0, set(published)
+    for a in order:
+        if places >= n:
+            break
+        if a in there:
+            places += 0 if more else 1
+            kept += 0 if more else 1
+        elif a in pool and (retry or not failed(a)):
+            built.append(a)
+            outcome = broken.get(a, "published")
+            if outcome == "OPENAI_EXCEPTION":            # the build raised: the batch stops, nothing is recorded
+                break
+            tried[a] = ("AGENT_ERROR" if outcome == "CRASH" else outcome, sid)
+            if outcome.startswith("AI_PROVIDER_"):
+                break
+            places += outcome == "published"
+    return built, int(needs_ai and len(search) > 1), kept
+
+
+def t_rerun_rules_random():
+    """400 random histories of one page, with the real ranking code and a stand-in for the AI's reply. Studies
+    appear in and vanish from the search, the AI ranks all, some or none of what it is shown (or sends rubbish, or
+    cannot be reached), downloads break and get fixed, datasets are taken off the site, two searches share the
+    page, the batch record is lost or is a version 1.0 record, and every option is used. What the batch builds,
+    how often it asks the AI, the ranking it remembers and what it records must match a second statement of the
+    rules every time. And always: nothing on the page is built again, a ranked study never changes place, and the
+    same request made twice in a row builds nothing the second time."""
+    import contextlib
+    import io
+    import random
+    sys.path.insert(0, str(AGENT))
+    import hegemon
+    from hegemon_nb import repos
+    from hegemon_nb.llm import ProviderError
+    rng = random.Random(20261006)
+    root = T / "random_runs"
+    env_keys = ("HEGEMON_RUNS", "HEGEMON_SITE_ROOT", "OPENAI_API_KEY", "HEGEMON_OFFLINE")
+    env_before = {k: os.environ.get(k) for k in env_keys}
+    originals = (hegemon.run_build, hegemon.published_under_key, hegemon.get_llm, repos.search_geo,
+                 repos.search_arrayexpress)
+    w = {}
+
+    class FakeAI(object):
+        """Answers the ranking request the real rank() sends."""
+        def ask(self, instructions, text, **options):
+            assert instructions.startswith("You rank"), instructions[:60]
+            w["asked"] += 1
+            if w["reply"] is None:
+                raise ProviderError("auth", "OpenAI rejected the API key (401). Run: hegemon key")
+            return w["reply"]
+
+    def fake_build(cfg, args, acc, llm=None, ds=None, publish_key=None, link_label=None, genes=None):
+        assert acc not in w["published"], "built {} although it is already on the page".format(acc)
+        w["built"].append(acc)
+        outcome = w["broken"].get(acc, "published")
+        if outcome == "OPENAI_EXCEPTION":
+            raise ProviderError("quota", "out of quota")
+        if outcome == "CRASH":
+            raise RuntimeError("simulated bug in the agent")
+        if outcome != "published":
+            return {"status": outcome, "detail": "simulated", "work": "", "code": 2}
+        w["published"][acc] = acc + "-GPL1"
+        return {"status": "published", "work": "", "code": 0, "url": None,
+                "receipt": {"samples": 6, "probes": 30, "groups": [], "timing": {"total": 1}}}
+
+    def run(key, topic, n, more=False, retry=False, rerank=False):
+        w.update(asked=0, built=[])
+        argv = ["batch", topic, "--key", key, "--count", str(n), "--min-samples", "0", "--max-samples", "0"]
+        argv += (["--more"] if more else []) + (["--retry-failed"] if retry else []) + (["--rerank"] if rerank else [])
+        text = io.StringIO()
+        with contextlib.redirect_stdout(text):
+            rc = hegemon.main(argv)
+        return rc, text.getvalue()
+
+    def same_search(topic):
+        return " ".join(topic.lower().split())
+
+    shutil.rmtree(str(root), ignore_errors=True)
+    os.environ.update(HEGEMON_RUNS=str(root), HEGEMON_SITE_ROOT=str(root / "site"), OPENAI_API_KEY="sk-local-test",
+                      HEGEMON_OFFLINE="1")
+    hegemon.run_build, hegemon.get_llm = fake_build, (lambda cfg, required=True: FakeAI())
+    hegemon.published_under_key = lambda cfg, key: dict(w["published"])
+    repos.search_geo = lambda q, limit=40: [repos.Dataset(a, "GEO", a + " study", kind="Expression profiling by array")
+                                            for a in w["search"]]
+    repos.search_arrayexpress = lambda q, limit=40: []
+    outcomes = ("DOWNLOAD_FAILED", "NO_PROCESSED_DATA", "AGENT_GAVE_UP", "publish_failed", "CRASH")
+    topics = ("random topic", "random topic", "Random  TOPIC", "second topic")   # the first three are one search
+    histories = runs = repeats = builds = left_out = 0
+    try:
+        for history in range(400):
+            key = "random{}".format(history)
+            record = root / "batches" / (key + ".json")
+            every = ["GSE{}".format(1000 + i) for i in range(rng.choice((2, 8, 20, 90)))]
+            w.update(search=rng.sample(every, rng.randint(1, min(len(every), 75))), published={},
+                     broken={a: rng.choice(outcomes) for a in rng.sample(every, rng.randint(0, len(every) // 3))})
+            memories, tried, last_topic = {}, {}, None
+            for step in range(rng.randint(3, 9)):
+                if step:        # the world moves between two runs
+                    for _ in range(rng.choice((0, 0, 1, 1, 2, 5))):       # studies the search did not return before
+                        unseen = [a for a in every if a not in w["search"]]
+                        if unseen:
+                            w["search"].insert(rng.randint(0, len(w["search"])), rng.choice(unseen))
+                    for _ in range(rng.choice((0, 0, 0, 1, 3))):          # studies the search stops returning
+                        if len(w["search"]) > 1:
+                            w["search"].remove(rng.choice(w["search"]))
+                    if rng.random() < 0.15:
+                        rng.shuffle(w["search"])                          # the repository changes its own order
+                    if rng.random() < 0.25:                               # downloads break and get fixed
+                        w["broken"] = {a: rng.choice(outcomes)
+                                       for a in rng.sample(every, rng.randint(0, len(every) // 3))}
+                    if rng.random() < 0.15 and w["published"]:            # a dataset is taken off the site
+                        del w["published"][rng.choice(sorted(w["published"]))]
+                    roll = rng.random()
+                    if roll < 0.04 and record.is_file():                  # the batch record is lost
+                        record.unlink()
+                        memories, tried = {}, {}
+                    elif roll < 0.12 and record.is_file():                # a record as version 1.0 wrote it
+                        state = json.loads(record.read_text())
+                        state.pop("rankings", None)
+                        for entry in state.get("tried", {}).values():
+                            entry.pop("search", None)
+                        record.write_text(json.dumps(state))
+                        memories = {}
+                        tried = {a: (outcome, same_search(last_topic)) for a, (outcome, _by) in tried.items()}
+                if rng.random() < 0.08:                                   # OpenAI fails in the middle of a build
+                    w["broken"][rng.choice(every)] = rng.choice(("AI_PROVIDER_QUOTA", "OPENAI_EXCEPTION"))
+                n = rng.choice((1, 2, 3, 5, 10, 12))
+                topic = rng.choice(topics)
+                how = rng.choice(({}, {}, {}, {"more": True}, {"retry": True}, {"rerank": True},
+                                  {"more": True, "retry": True}, {"more": True, "rerank": True}))
+                # what the AI would answer today, if it is asked
+                shown = w["search"][:max(60, n * 6)]
+                roll = rng.random()
+                if roll < 0.1:
+                    picks, w["reply"] = None, None                        # it cannot be reached
+                elif roll < 0.15:
+                    picks = []                                            # a reply that ranks nothing
+                    w["reply"] = rng.choice(("I cannot do that.", "{not json}", '{"ranked": []}', '{"ranked": null}',
+                                             '{"genes": ["ACTB"]}', '{"ranked": "GSE1000", "genes": 7}'))
+                else:
+                    picks = rng.sample(shown, rng.randint(0, len(shown)))
+                    if rng.random() < 0.5:
+                        picks = picks[:rng.randint(0, 12)]                # it ranks a few and leaves the rest out
+                    if rng.random() < 0.15:
+                        picks.insert(rng.randint(0, len(picks)), "GSE000")              # not in the list at all
+                    if rng.random() < 0.1 and picks:
+                        picks.insert(rng.randint(0, len(picks)), rng.choice(picks).lower())
+                    if rng.random() < 0.1 and picks:
+                        picks.insert(rng.randint(0, len(picks)), rng.choice(picks))     # the same one twice
+                    if rng.random() < 0.1 and len(w["search"]) > len(shown):
+                        picks.insert(rng.randint(0, len(picks)), rng.choice(w["search"][len(shown):]))  # not shown
+                    entries = [a if rng.random() < 0.1 else
+                               {"accession": a, "why": ["a", "list"] if rng.random() < 0.05 else "because " + a}
+                               for a in picks]
+                    w["reply"] = "Ranking:\n" + json.dumps({"ranked": entries, "genes": ["ACTB", "GAPDH"]})
+                sid = same_search(topic)
+                was_on_page, before = set(w["published"]), {s: list(o) for s, o in memories.items()}
+                rc, out = run(key, topic, n, **how)
+                want_built, want_asked, kept = _rerun_rules(
+                    memories, tried, was_on_page, sid, list(w["search"]), w["broken"], picks, n,
+                    how.get("more", False), how.get("retry", False), how.get("rerank", False))
+                last_topic = topic
+                state = json.loads(record.read_text())
+                where = "history {} step {} topic {!r} options {} n {} picks {}\n{}".format(
+                    history, step, topic, how, n, picks if picks is None else picks[:8], out[-1500:])
+                assert "Traceback" not in out, where
+                assert w["built"] == want_built, ("built", w["built"], want_built, where)
+                assert w["asked"] == want_asked, ("AI calls", w["asked"], want_asked, where)
+                got = {s: m["order"] for s, m in (state.get("rankings") or {}).items()}
+                assert got == memories, ("rankings", got, memories, where)
+                assert [(a, v["status"], v["search"]) for a, v in state.get("tried", {}).items()] == \
+                    [(a, outcome, by) for a, (outcome, by) in tried.items()], ("tried", where)
+                assert state["query"] == topic, where
+                assert not set(w["built"]) & was_on_page, ("built again", w["built"], where)
+                if not how.get("rerank"):
+                    for s, order in before.items():
+                        assert [a for a in memories[s] if a in order] == order, ("a ranked study moved", s, where)
+                # what it printed is true
+                pool = w["search"][:max(60, n * 6)]
+                for line in out.splitlines():
+                    if line.startswith(("   For the ", "   To try ")):
+                        assert ("--count {}".format(n) in line) == (n != 10), (line, where)
+                        assert line.split(": ", 1)[1].startswith("hegemon batch --key " + key), (line, where)
+                    if line.startswith("   To try "):
+                        assert (" --more" in line) == bool(how.get("more")), (line, where)
+                    if "The AI ranked" in line:
+                        listed = [a for a in dict.fromkeys(picks or []) if a in pool]
+                        for a, place in re.findall(r"(GSE\d+) \(#(\d+)\)", line):
+                            assert a in listed and listed.index(a) + 1 == int(place), (line, listed[:10], where)
+                    if "out of its ranking" in line:
+                        left_out += 1
+                        for a in re.findall(r"GSE\d+", line.split("out of its ranking", 1)[1]):
+                            assert a in pool and a not in (picks or []) and a not in before.get(sid, []), (line, where)
+                if "The ranking covers the first" in out:
+                    assert len(w["search"]) > len(pool), where
+                if not how.get("more") and not w["built"]:
+                    assert ("Nothing was added." in out and rc == 0) == (kept > 0), (rc, kept, where)
+                if w["built"]:
+                    assert "Nothing new for" not in out and "Nothing was added." not in out, where
+                runs += 1
+                builds += len(w["built"])
+                if any(w["broken"].get(a) in ("AI_PROVIDER_QUOTA", "OPENAI_EXCEPTION") for a in w["built"]):
+                    continue    # the run was stopped by an OpenAI problem, so there is work left on purpose
+                # the same request again, nothing else changed: nothing is built
+                on_page_before = dict(w["published"])
+                rc, out = run(key, topic, n)
+                want_built, want_asked, kept = _rerun_rules(memories, tried, set(on_page_before), sid,
+                                                            list(w["search"]), w["broken"], picks, n, False, False,
+                                                            False)
+                assert w["built"] == [] == want_built, ("the same thing again built", w["built"], where, out[-1500:])
+                assert w["asked"] == want_asked, ("AI calls on the repeat", w["asked"], want_asked, where)
+                assert w["published"] == on_page_before and "Traceback" not in out, where
+                assert ("Nothing was added." in out and rc == 0) == (kept > 0), (rc, kept, where, out[-1500:])
+                repeats += 1
+            histories += 1
+    finally:
+        (hegemon.run_build, hegemon.published_under_key, hegemon.get_llm, repos.search_geo,
+         repos.search_arrayexpress) = originals
+        for name, value in env_before.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    assert histories == 400 and runs > 2000 and builds > 3000 and left_out > 100, (histories, runs, builds, left_out)
+    assert not list((root / "batches").glob("*.tmp")), "a half-written batch record was left behind"
+    print("   {} histories, {} runs ({} datasets built), {} immediate repeats that built nothing".format(
+        histories, runs, builds, repeats), flush=True)
 
 
 def t_arrayexpress_sdrf():
@@ -1931,6 +2541,115 @@ def t_ai_picks_files():
     assert chosen == ["Skin_raw_counts.txt"] and why == "raw counts only", (chosen, why)
 
 
+def t_agent_command():
+    """`hegemon agent` asks what to look for and then runs the very same batch; `hegemon install` makes
+    `hegemon` a command in a new login shell."""
+    sys.path.insert(0, str(AGENT))
+    import hegemon
+    assert hegemon.key_from_query("psoriasis lesional skin") == "psoriasislesionalskin"
+    assert hegemon.key_from_query("Regulatory T cells in Crohn's disease") == "regulatorytcellscrohns"
+    assert hegemon.key_from_query("IBD") == "ibd"
+    assert re.match(r"^[A-Za-z0-9._+-]+$", hegemon.key_from_query("!!! ???"))
+
+    # 1. the question, then the batch: same fake search/download as the batch test, typed at the prompt
+    site = php_site()
+    good = (HERE / "fixture_geo_convert.py").read_text()
+    plan = [{"text": "Rank\n" + json.dumps({"ranked": [{"accession": "GSE999001", "why": "direct match"},
+                                                       {"accession": "GSE999003", "why": "second"}]})}]
+    plan += [{"text": "Source: GSM VALUE tables.\n```python\n" + good + "\n```"}] * 6
+    runner = T / "batch_runner.py"
+    if not runner.is_file():
+        raise Skip("run the batch test first (it writes the fake search runner)")
+    ai = _mock(plan)
+    php = start(["php", "-S", "127.0.0.1:8765", "-t", str(site)], 8765)
+    try:
+        p = subprocess.run([PY, str(runner), "agent", "--count", "2", "--min-samples", "0"], env=env(),
+                           input="regulatory T cells in Crohn's disease\n", stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=900)
+    finally:
+        stop(ai)
+        stop(php)
+    out = p.stdout
+    assert p.returncode == 0, out
+    key = "regulatorytcellscrohns"
+    assert "What datasets do you want to look for?" in out, out[:600]
+    assert "Your page: http://127.0.0.1:8765/explore.php?key=" + key in out, out[:800]
+    assert "Batch '{}': 2 dataset(s) for: regulatory T cells in Crohn's disease".format(key) in out, out[:900]
+    assert "2 dataset(s) are now on one page under key '{}'".format(key) in out, out[-2500:]
+    conf = (site / "explore.conf").read_text()
+    assert conf.count("key= " + key) == 2, conf
+    assert (site / "index.html").read_text().count("explore.php?key=" + key) == 1
+    state = json.loads((T / "runs" / "batches" / (key + ".json")).read_text())
+    assert state["query"] == "regulatory T cells in Crohn's disease"
+    # the same topic typed again: nothing is duplicated or rebuilt, it says the best are already there, and
+    # the AI (which would now rank the other study first) is not asked
+    before = ((site / "explore.conf").read_bytes(), (site / "index.html").read_bytes())
+    ai = _mock([{"text": "Rank\n" + json.dumps({"ranked": [{"accession": "GSE999002", "why": "changed its mind"}]})}])
+    php = start(["php", "-S", "127.0.0.1:8765", "-t", str(site)], 8765)
+    try:
+        p = subprocess.run([PY, str(runner), "agent", "--count", "2", "--min-samples", "0"], env=env(),
+                           input="Regulatory T cells in Crohn's disease\n", stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=900)
+    finally:
+        stop(ai)
+        stop(php)
+    assert p.returncode == 0, p.stdout
+    assert ((site / "explore.conf").read_bytes(), (site / "index.html").read_bytes()) == before, p.stdout[-2500:]
+    assert (T / "ai-log.jsonl").read_text() == "", "the AI was asked although nothing was new"
+    for line in ("Your page: http://127.0.0.1:8765/explore.php?key=" + key,
+                 "The best 2 datasets for \"Regulatory T cells in Crohn's disease\" are already on your page. "
+                 "Nothing was added.",
+                 "For the next 2 down the ranking: hegemon agent --more --count 2\n",
+                 "Your page (2 datasets): http://127.0.0.1:8765/explore.php?key=" + key):
+        assert line in p.stdout, (line, p.stdout[-2500:])
+    # nothing typed: nothing starts
+    p = subprocess.run([PY, str(runner), "agent"], env=env(), input="\n\n", stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+    assert p.returncode == 1 and "Nothing was typed" in p.stdout and "Searching" not in p.stdout, p.stdout
+
+    # 2. hegemon install: a brand-new login shell knows `hegemon` and `hegemon-agent`
+    if not shutil.which("bash"):
+        return
+    layouts = {
+        "ubuntu": {".profile": 'if [ -n "$BASH_VERSION" ]; then\n  if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi\nfi\n',
+                   ".bashrc": "case $- in\n    *i*) ;;\n      *) return;;\nesac\nexport FOO=1\n"},
+        "bash_profile": {".bash_profile": "export FOO=1"},          # no trailing newline, does not source .bashrc
+        "empty": {},
+    }
+    for name, files in layouts.items():
+        home = T / "homes" / name
+        shutil.rmtree(str(home), ignore_errors=True)
+        home.mkdir(parents=True)
+        for fname, text in files.items():
+            (home / fname).write_text(text)
+        e = env(HOME=str(home), SHELL="/bin/bash", HEGEMON_PYTHON=PY)
+        for _again in range(2):   # running it twice must not add the line twice
+            r = subprocess.run(["bash", str(AGENT / "hegemon"), "install"], env=e, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+            assert r.returncode == 0 and "a new login shell knows the command `hegemon`" in r.stdout, (name, r.stdout)
+        for rc in home.glob(".*"):
+            if rc.is_file() and rc.name != ".hegemon-agent-commands.sh":
+                assert rc.read_text().count("# hegemon-agent command") == 1, (name, rc.name, rc.read_text())
+        login = subprocess.run(["bash", "-lic", "type hegemon; type hegemon-agent; hegemon --help"], env=e,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               universal_newlines=True, timeout=120)
+        assert "hegemon is a function" in login.stdout and "hegemon-agent is aliased" in login.stdout, (name, login.stdout)
+        assert "agent" in login.stdout and "usage: hegemon" in login.stdout, (name, login.stdout[-800:])
+        if name == "bash_profile":
+            assert (home / ".bash_profile").read_text().startswith("export FOO=1\n["), "line glued onto the last one"
+    # installed inside the home folder (the server's layout, reached through a symlink): the command is
+    # written relative to $HOME, not to wherever the symlink points
+    home = T / "homes" / "inside"
+    shutil.rmtree(str(home), ignore_errors=True)
+    home.mkdir(parents=True)
+    (home / "hegemon-agent").symlink_to(AGENT)
+    e = env(HOME=str(home), SHELL="/bin/bash", HEGEMON_PYTHON=PY)
+    r = subprocess.run(["bash", str(home / "hegemon-agent" / "hegemon"), "install"], env=e, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+    assert r.returncode == 0 and "a new login shell knows the command `hegemon`" in r.stdout, r.stdout
+    assert 'bash "$HOME/hegemon-agent/hegemon" "$@"' in (home / ".hegemon-agent-commands.sh").read_text()
+
+
 def main():
     if not (T / "fixtures" / "geo").is_dir():
         subprocess.run([PY, str(HERE / "make_fixtures.py"), str(T / "fixtures")], check=True)
@@ -1946,12 +2665,15 @@ def main():
              ("publish failure restores explore.conf and index.html", t_publish_rollback),
              ("AI repair loop (mock OpenAI endpoint)", t_ai_repair_loop),
              ("AI provider errors and UNCONVERTIBLE are reported as such", t_ai_outcomes),
+             ("local and mixed modes: local model route, no key, cut-off warning, tunnel-down stop", t_local_mode),
              ("ArrayExpress build vs the lab notebook run on the same files", t_ae_build_vs_notebook),
              ("real Hegemon sample data: notebook idx + publish + PHP lookups", t_real_data_through_php),
              ("GEO page parsers and AI reply parsing", t_repo_parsers),
              ("shared key: many datasets on one Hegemon page", t_shared_key),
              ("metadata plot check refuses a dataset Hegemon cannot group", t_metadata_plot_check),
              ("batch: 10-under-one-key, survives failures, continues on re-run", t_batch_shared_key),
+             ("asking for the same thing again adds only what is new; --more goes further down", t_batch_rerun),
+             ("the rerun rules hold on 400 random histories of one page", t_rerun_rules_random),
              ("ArrayExpress SDRF is mandatory and complete", t_arrayexpress_sdrf),
              ("diagnose names the unplottable dataset already on a site", t_diagnose),
              ("GEO downloads the cheapest source, not the big bundle", t_geo_acquisition_plan),
@@ -1968,7 +2690,8 @@ def main():
              ("error pages are never saved as data; picky servers still deliver", t_download_integrity),
              ("speed-ups give exactly what plain pandas gives", t_fast_paths_match),
              ("a study on a site never seen before: page links, AI asks for files, extras left out", t_any_site_fetch),
-             ("the AI picks between big alternative files before they download", t_ai_picks_files)]
+             ("the AI picks between big alternative files before they download", t_ai_picks_files),
+             ("hegemon agent asks, then runs the same batch; hegemon install makes the command", t_agent_command)]
     only = sys.argv[1:]
     for name, fn in tests:
         if not only or any(o in fn.__name__ for o in only):

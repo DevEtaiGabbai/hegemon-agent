@@ -1,4 +1,5 @@
-"""Local stand-in for the OpenAI Responses endpoint (tests only). Replies come from a JSON plan file."""
+"""Local stand-in for the OpenAI Responses endpoint and a local model's chat-completions endpoint (tests only).
+Replies come from a JSON plan file."""
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -8,12 +9,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         with open(log_path, "a") as log:
-            log.write(json.dumps({"auth": self.headers.get("Authorization", "")[:12], "body": body}) + "\n")
+            log.write(json.dumps({"auth": self.headers.get("Authorization", "")[:12], "path": self.path, "body": body}) + "\n")
         plan = json.load(open(plan_path))
         step = plan.pop(0) if len(plan) > 1 else plan[0]
         json.dump(plan, open(plan_path, "w"))
         if step.get("status", 200) != 200:
             payload = {"error": step["error"]}
+        elif self.path.endswith("/chat/completions"):
+            payload = {"choices": [{"message": {"role": "assistant", "content": step["text"]}, "finish_reason": "stop"}],
+                       "usage": {"prompt_tokens": step.get("prompt_tokens", 1000), "completion_tokens": 200}}
         else:
             payload = {"status": "completed", "usage": {"input_tokens": 1000, "output_tokens": 200},
                        "output": [{"type": "reasoning"}, {"type": "message", "content": [{"type": "output_text", "text": step["text"]}]}]}

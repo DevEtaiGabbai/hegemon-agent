@@ -2,6 +2,110 @@
 
 Finds a public dataset (GEO or ArrayExpress) and turns it into a native Hegemon dataset the way the lab's notebooks do. It then publishes it to your Hegemon site and proves it works through Hegemon's own pages.
 
+## Start here
+
+After `ssh`, type:
+
+```
+hegemon agent
+```
+
+It asks **What datasets do you want to look for?** Type a topic and press Enter. From there it is the batch
+described in the next section, with its default settings: it searches, ranks, and puts the 10 best datasets on
+one Hegemon page, and prints that page's address before it starts. The page's key is made from the words you
+type (`psoriasis lesional skin` becomes `psoriasislesionalskin`), so typing the same words another day goes to the
+same page. Asking for the same thing again never duplicates a dataset: what is already on the page is skipped, and
+only a dataset that is new in the best 10 is added. If nothing is new it says so and builds nothing. For the next 10
+down the ranking, type `hegemon agent --more` and give the same topic. `hegemon agent` takes the same options as
+`hegemon batch` (`--count`, `--max-samples`, `--key`, ...) if you ever want them.
+
+One-time setup, so that `hegemon` is a command in your shell:
+
+```
+bash ~/hegemon-agent/hegemon install
+```
+
+Then log out and ssh in again. It adds one line to your shell start-up files and checks that a new login shell
+knows the command. `hegemon-agent` (the old name) works too.
+
+## Local, mixed or cloud models (1.2)
+
+The first time you run `hegemon agent` it asks where the AI should run, and remembers the answer
+(in `~/.config/hegemon-agent/settings.json`). Change it any time with `hegemon mode`.
+
+1. **cloud**: OpenAI does everything, exactly as before.
+2. **local**: your own model does everything. Free, no OpenAI key needed. If it can't convert a dataset,
+   that dataset fails the normal way and the batch moves on; it never switches to OpenAI by itself.
+3. **mixed**: your own model ranks the search results and picks files; OpenAI writes the conversions.
+
+For local and mixed, the agent tests the model before every run. If it can't reach it, it says so and lets
+you retry, type a new address or model name, or type `cloud`. (Known limit in 1.2: the test waits up to 5 minutes
+without printing anything when the tunnel is silently dead; run the `curl -m 20` check below first.)
+
+### How the laptop model reaches the server (read this first)
+
+The agent runs on the lab server. The model runs on your laptop (Ollama). The server cannot see your laptop,
+so you give it a door: an ssh **reverse tunnel**. When you log in with `-R 21434:127.0.0.1:11434`, the
+server gets a port, `21434`, and anything the agent sends to `localhost:21434` on the server comes out of
+your laptop's Ollama (`127.0.0.1:11434`).
+
+Log in like this, every time, from the laptop (Windows Command Prompt):
+
+    ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -R 21434:127.0.0.1:11434 yusuf.kadry1@hegemon.ucsd.edu
+
+Then, on the server, once per login (the first successful local setup saves it, after that it is optional):
+
+    export HEGEMON_LOCAL_URL=http://localhost:21434/v1
+    hegemon agent
+
+What each part is for:
+
+- `-R 21434:127.0.0.1:11434` is the tunnel. Use `127.0.0.1`, not `localhost`: on Windows `localhost` goes to
+  IPv6 and Ollama does not listen there ("Empty reply from server").
+- Port **21434**, not 11434. On the server, 11434 was already taken (a dead tunnel from an earlier login, or
+  someone else's). When the port is taken, plain ssh logs you in **without a tunnel** (at most a one-line
+  "remote port forwarding failed" warning that scrolls past), and every request to the model then hangs.
+- `ExitOnForwardFailure=yes` makes ssh refuse to log in if the tunnel can't be made
+  (`Error: remote port forwarding failed for listen port ...`). Then change the number (`21435`, `21436`, ...)
+  in both the login command and `HEGEMON_LOCAL_URL`.
+- `ServerAliveInterval=15` keeps the connection from going idle. Mobile and campus networks drop idle
+  connections; the server doesn't notice, keeps the port, and the next login can't get it.
+
+Keep that ssh window open and Ollama running on the laptop for as long as the agent runs. Closing the window
+ends the tunnel and the run stops with an AI-provider message (not a dataset failure).
+
+**The problem we hit, and how to recognise it**
+
+| What you see | What it means | Fix |
+|---|---|---|
+| `hegemon agent` sits at "testing ... at http://localhost:11434/v1" for minutes; `ollama ps` on the laptop shows nothing | the server's port is held by a dead or foreign tunnel, requests go nowhere | log in with a different port (above) |
+| `Error: remote port forwarding failed for listen port 11434` | that port is taken on the server | use 21434 (or 21435...) |
+| `curl: (52) Empty reply from server` on the server | the tunnel exists but the laptop end can't connect: usually `localhost` instead of `127.0.0.1` | use `127.0.0.1` in the `-R` part |
+| `curl: (7) Connection refused` on the server | no tunnel at all (you logged in without `-R`) | log in with the command above |
+| `curl http://127.0.0.1:11434/v1/models` fails **on the laptop** | Ollama isn't running | start it: `ollama serve` (or open the Ollama app) |
+
+Check the tunnel in 10 seconds, before starting the agent. On the server:
+
+    curl -m 20 http://localhost:21434/v1/models
+
+It must print a list that includes `qwen2.5-coder-16k`. If it prints nothing within 20 seconds, the tunnel is
+the problem, not the agent and not the model. (Never kill other people's logins to free a port; pick another port.)
+
+The model needs a 16384-token context window; Ollama's default (4096) cuts the prompts short. Made once:
+
+    echo FROM qwen2.5-coder:3b> Modelfile
+    echo PARAMETER num_ctx 16384>> Modelfile
+    ollama create qwen2.5-coder-16k -f Modelfile
+
+`qwen2.5-coder-16k` is the default local model name. If a prompt still gets cut short, every call says so
+("its context window cut the prompt short").
+
+Settings: `HEGEMON_MODE` (cloud, local, mixed), `HEGEMON_LOCAL_URL` (default `http://localhost:11434/v1`; with the tunnel above it is `http://localhost:21434/v1`),
+`HEGEMON_LOCAL_MODEL`. Any OpenAI-compatible server works (Ollama, LM Studio, vLLM).
+
+Not tested yet: how well a 3B model converts real datasets. Expect many more `AGENT_GAVE_UP` than in cloud
+mode, and slower answers (1-2 minutes per attempt on a 3050 Ti, an estimate).
+
 ## Ten datasets on one page (one shared key)
 
 ```
@@ -19,31 +123,71 @@ http://hegemon.ucsd.edu/~yusuf.kadry1/Hegemon/explore.php?key=tregcd
 The homepage gets **one** link for the whole set, not ten. Nothing in Hegemon changes: the `key=` field already
 works this way.
 
-To process the next 10 later, run the same command again:
-
-```
-hegemon batch --key tregcd            # reuses the saved query, adds 10 more
-hegemon batch --key tregcd --count 5  # or add 5
-```
-
-It skips what is already published under that key (it reads `explore.conf`, so that is always accurate) and works
-down the ranking for new ones. A different set of datasets goes under a different key:
+A different set of datasets goes under a different key:
 
 ```
 hegemon batch "ulcerative colitis biopsies" --key uc
 ```
 
+### Asking for the same thing again
+
+Run the same search again and the page is kept at the **best 10 for that search**. Nothing is duplicated:
+
+- A dataset that is already on the page is skipped. The agent reads `explore.conf` to know what is there, so that
+  is always accurate.
+- A dataset that is new in the best 10 is built and added.
+- When nothing in the best 10 is new, nothing is built and it says so:
+  `The best 10 datasets for "..." are already on your page. Nothing was added.`
+- A dataset that was tried before and did not publish is left alone and named in the output, whatever the reason
+  was. `--retry-failed` tries those again. Two kinds are tried again without it, because the dataset never got its
+  try: one that was stopped by an OpenAI problem, and one that a limit turned away (`--max-samples`,
+  `--min-samples`, the size limits) once that limit lets more through.
+
+```
+hegemon batch --key tregcd                  # the same search again: adds only what is new in the best 10
+hegemon batch --key tregcd --more           # the next 10 down the ranking (what a second run used to do)
+hegemon batch --key tregcd --more --count 5 # or the next 5
+hegemon batch --key tregcd --count 20       # keep the best 20 on the page instead of the best 10
+hegemon batch --key tregcd --retry-failed   # also try again what did not publish before
+hegemon batch --key tregcd --rerank         # forget the saved ranking and rank every study again
+```
+
+**The ranking is remembered.** The AI ranks about 60 studies, and asked twice it does not return exactly the same
+order. If the ranking were made fresh on every run, a study that was 11th last time could come back 9th and get
+built although nothing had changed. So the ranking a search gets is saved in the batch record and used again:
+
+- A study the search has returned before keeps its place.
+- A study the search has not returned before (newly added to GEO or ArrayExpress, say) is ranked by the AI and
+  goes in at the rank it gets. A new study that is 4th best today becomes 4th, so it is built. A new study the
+  AI is shown and leaves out of its ranking has no rank, so it goes last, wherever the repository lists it.
+- When the search returns nothing it has not already ranked, the AI is not asked at all.
+- A dataset that is on the page keeps its place in the best 10 even on a day the search does not return it.
+- `--rerank` forgets the saved ranking for that search and ranks every study again.
+
+A page made before version 1.1 has no saved ranking. The first run on such a page keeps its datasets in the order
+they were tried and ranks the other studies after them, so a page that is already full gets nothing new on that
+run. The same happens after a run on which the AI could not be reached: that run uses the repository's order,
+saves nothing as a ranking, and what it built keeps its place when the AI answers again.
+
+A different search under the same key is ranked on its own; the batch record keeps which search tried which
+dataset. Two searches are the same when their words are (capitals and spacing do not matter). `ER+ breast cancer`
+and `ER- breast cancer` are two searches, although `hegemon agent` gives both the same page key.
+
+The commands printed at the end of a run (`... --more`, `... --retry-failed`) repeat that run's own `--key` and
+`--count`, so they can be copied as they are.
+
 Each dataset is published the moment it passes, so a batch that dies halfway still leaves a usable page. One
 dataset failing never stops the batch; the summary at the end lists what did not make it and why. An OpenAI key,
 quota or model problem does stop it, because every later dataset would fail the same way.
 
-Options: `--count N` (default 10), `--label "text for the homepage link"`, `--retry-failed` (also retry datasets
-that failed in an earlier run for a dataset-specific reason), `--max-samples N` (leave out studies with more than N
+Options: `--count N` (how many of the best datasets the page should hold, default 10; with `--more`, how many to
+add), `--more`, `--rerank`, `--label "text for the homepage link"`, `--retry-failed` (also try again the datasets
+that did not publish in an earlier run, whatever the reason), `--max-samples N` (leave out studies with more than N
 samples; default **250** for `batch` and the search menu, `0` for no limit). The lab's `jupyter_gse_processing`
 takes several minutes on a study of 1,000 samples, so the default keeps each dataset to a few minutes.
 
-A record of each batch is kept in `<runs>/batches/<key>.json`: every accession tried, its outcome, and its build
-folder.
+A record of each batch is kept in `<runs>/batches/<key>.json`: every accession tried, its outcome, its build
+folder, and the ranking each search got.
 
 ## What gets published: enough samples, and metadata you can group by
 
@@ -86,7 +230,8 @@ hegemon unpublish --key tregibd                   # take off everything under a 
 It shows what it will remove and asks first (`--yes` to skip). It removes the `explore.conf` sections and, when
 no dataset is left under a key, that key's homepage link. The previous `explore.conf` and `index.html` are saved
 in `.hegemon-agent-backups/`, and both are restored if `explore.php` stops loading. The data files are not
-deleted. After taking a set off, run the batch again and it rebuilds that key from the next good datasets.
+deleted. After taking a set off, run the same search again and it builds the page again: a dataset that is no
+longer on the page counts as new, so a dataset you took off on purpose comes back if it is still in the best 10.
 
 ## Checking what is already on your site
 
@@ -309,8 +454,9 @@ Expected, deliberate differences:
 
 ```
 ~/hegemon-agent/hegemon                                      # search, pick one from the menu, build, publish
-~/hegemon-agent/hegemon batch "your topic" --key yourkey     # 10 datasets on one page
-~/hegemon-agent/hegemon batch --key yourkey                  # the next 10 under the same key
+~/hegemon-agent/hegemon batch "your topic" --key yourkey     # the best 10 datasets on one page
+~/hegemon-agent/hegemon batch --key yourkey                  # the same search again: adds only what is new
+~/hegemon-agent/hegemon batch --key yourkey --more           # the next 10 down the ranking
 ~/hegemon-agent/hegemon build GSE12345                       # one accession
 ~/hegemon-agent/hegemon diagnose                             # check what is already on the site
 ~/hegemon-agent/hegemon unpublish --key yourkey              # take a set off the site (files kept)
@@ -347,8 +493,9 @@ The last line says why, and it says whether the cause is the dataset or not.
 These are about the dataset:
 
 - `TOO_FEW_SAMPLES`: fewer samples than `--min-samples`.
-- `TOO_MANY_SAMPLES`: more samples than `--max-samples` (only when you set it; not remembered as a failure, so a
-  later run without the limit tries it again).
+- `TOO_MANY_SAMPLES`: more samples than `--max-samples`. The limit is kept with the outcome, so a later run with a
+  higher limit, or none, tries the dataset again; with the same limit it is left alone. (A record written before
+  version 1.1 did not keep the limit: use `--retry-failed` for those.)
 - `NOT_HOSTED`: the file that holds the data is listed but can't be downloaded, and no other file holds it
   (decided by the AI after looking at everything the study offers).
 - `SINGLE_CELL`: a single-cell study; skipped until the single-cell blueprint is added.
@@ -362,7 +509,7 @@ These are not about the dataset, and I want to hear about them:
 
 - `MISSING_FILES`: the AI still says a file is missing after being told to fetch it. Rare now.
 - `FILES_TOO_LARGE`: the data exists but the size limits refused it. Raise `HEGEMON_MAX_FILE_GB` and
-  `HEGEMON_MAX_TOTAL_GB`, or pass `--yes`, and run it again.
+  `HEGEMON_MAX_TOTAL_GB`, or pass `--yes`, and run it again: a batch tries it again once a limit is higher.
 - `AGENT_GAVE_UP`: this agent could not write a working conversion. Its limit, not the dataset's.
 - `AI_PROVIDER_*`: an OpenAI key, quota or model problem.
 - `LAB_SCRIPT_FAILED` or `SUPPORT_FILES_BAD`: the lab script's output.
@@ -391,7 +538,7 @@ If a publish fails with "does not list the dataset" or "explore.php crashed", th
 
 ## What has and hasn't been tested
 
-`tests/run_local_tests.py` passes 32/32 on Python 3.8.20 with pandas 2.0.3 (the server's versions). What those tests ran for real:
+`tests/run_local_tests.py` passes 35/35 on Python 3.8.20 with pandas 2.0.3 (the server's versions). What those tests ran for real:
 
 - The SOFT reader gives the same objects as GEOparse.
 - A GEO microarray build gives expr, ih and idx files byte-identical to what the lab's GEO notebook cells produce on the same files.
@@ -405,6 +552,37 @@ If a publish fails with "does not list the dataset" or "explore.php crashed", th
   site files restored; `diagnose` names that same dataset when it is already published.
 - A batch publishes what works under one shared key, carries on past a dataset that fails to download, records
   every outcome, and on a second run skips what is already published.
+- Asking for the same thing again: with nothing new, nothing is built, the AI is not called, `explore.conf` and
+  `index.html` stay byte-identical, and the output says the best N are already on the page and names the dataset
+  that did not publish before. A study the search had not returned before, ranked 2nd by the AI, is built, while
+  two studies the AI moved up that day stay where they were and are not built. A new study the AI is shown and
+  leaves out goes last and is not built, although the repository lists it first. `--more` builds the next one
+  down the saved ranking, `--retry-failed` gives a failed dataset another try, `--rerank` lets the AI's order of
+  the day decide, and a published dataset the search stops returning still holds its place.
+- A batch record as version 1.0 wrote it (no saved ranking, no note of which search tried what) builds nothing new
+  on a full page. With two searches on one page and a run on which the AI cannot be reached, repository order is
+  never saved as a ranking, and when the AI answers again each search keeps only its own datasets in place.
+- Datasets turned away by `--max-samples 5` are left alone on the next run with the same limit and tried again,
+  without `--retry-failed`, once the limit is lifted. The commands printed at the end carry the run's own `--key`
+  and `--count`. `--count 0` is refused. A batch record cut in half gives one plain sentence, not a traceback.
+- The same rules on 400 random histories of one page (2,442 runs, 4,941 datasets built), using the real ranking
+  code with a stand-in for the AI's reply: studies appear in and vanish from the search; the AI ranks all, some or
+  none of what it is shown, sends rubbish, or cannot be reached; downloads break and get fixed; datasets are taken
+  off the site; two searches share the page; the batch record is lost or is a version 1.0 record; and every
+  option is used. What was built, how often the AI was asked, the ranking that was saved and what was recorded
+  matched a second, separately written statement of the rules on every run. In all of them nothing already on the
+  page was built again, no ranked study changed place, and the same request made twice in a row built nothing the
+  second time (2,357 times).
+- Breaking the new code in 37 ways, one at a time, made these tests fail every time.
+- A reviewer that had not seen the code being written compared it with its own statement of the rules on about
+  46,000 random runs and reported seven problems at the edges (a new study the AI left out could still be built;
+  one search could pick up another search's datasets; `ER+` and `ER-` counted as one search; a lifted limit no
+  longer gave a dataset another try; printed commands that dropped `--count` or `--key`; two crashes on odd AI
+  replies; `--count 0`). All seven are fixed and each is in the tests above. The reviewer's comparison, brought
+  in line with the corrected rules, then found nothing wrong on 70,284 more random runs (run by hand; it
+  is not part of the test file).
+- A page built by version 1.0 and then asked for again with 1.1 gets nothing new and is left byte-identical;
+  version 1.0 still runs on a batch record that 1.1 has written (checked by hand, not part of the test file).
 - Against a local stand-in for GEO: when its computed counts exist only those are fetched and the bundle is left
   alone; without them the per-sample files are fetched individually into `GSE###_RAW/` and the bundle is still left
   alone, with raw files skipped; the bundle is used only when nothing else yields data; and a size limit produces
@@ -457,11 +635,19 @@ If a publish fails with "does not list the dataset" or "explore.php crashed", th
 - A 20 MB file downloaded as 4 ranges is byte-identical to the original, including when one range's connection is
   cut half way; a server without range support gets a normal single download.
 
+- `hegemon agent`: a topic typed at the prompt runs the same batch (same output, same published page, same batch
+  record) under a key made from the words; an empty answer starts nothing. The same topic typed a second time
+  changes nothing on the site, calls the AI zero times and says the best datasets are already on the page.
+  `hegemon install` makes `hegemon` and `hegemon-agent` work in a new login shell for three start-up file
+  layouts, and running it twice adds nothing.
+
 Not tested locally:
 
 - the lab's `jupyter_gse_processing` (a FAKE stand-in wrote thr/info/vinfo/bv)
 - real OpenAI calls
 - real downloads from GEO and ArrayExpress (the sandbox can't reach them)
+- how much the real AI's ranking moves between two runs, and how much GEO's search results move from day to day.
+  The saved ranking is there so that neither can reshuffle a page, but the local tests only imitate both.
 
 The first real build on the server is the real test of those three.
 

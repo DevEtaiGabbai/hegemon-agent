@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Hegemon agent: find a public dataset, convert it the way the lab notebook does, publish it to Hegemon.
 
+  hegemon agent                 asks what to look for, then puts the 10 best datasets on one Hegemon page
+                                (ask for the same thing again: only what is new in the best 10 is added)
+  hegemon agent --more          the same question, but adds the next 10 down the ranking
   hegemon                       search, pick, build, publish (interactive)
   hegemon search "query"
   hegemon build GSE51984        build one accession (options: --platform, --source, --script, --yes, --no-publish)
   hegemon publish BUILD_FOLDER  publish a finished build
   hegemon compare AGENT_FOLDER LAB_FOLDER   compare with a dataset the lab built by hand
-  hegemon check                 check the server setup and the OpenAI key/model
+  hegemon mode                  choose local, mixed or cloud models (asked the first time you run hegemon agent)
+  hegemon check                 check the server setup and the AI model(s)
   hegemon key                   save or replace the OpenAI API key
 """
 import argparse
@@ -22,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hegemon_nb import compare as compare_mod, convert, evidence, native, net, publish, repos, ui  # noqa: E402
-from hegemon_nb.config import VERSION, Config  # noqa: E402
+from hegemon_nb.config import MODE_TEXT, MODES, VERSION, Config, load_settings, save_settings  # noqa: E402
 from hegemon_nb.geo_soft import read_geo_soft  # noqa: E402
 from hegemon_nb.llm import LLM, ProviderError, load_key, save_key  # noqa: E402
 
@@ -60,6 +64,8 @@ RANK_INSTRUCTIONS = (
 
 
 def get_llm(cfg, required=True):
+    if not cfg.needs_key():
+        return LLM(None, cfg)          # local mode: no OpenAI key, no OpenAI calls
     key = load_key(cfg, prompt=required)
     if not key:
         if required:
@@ -96,15 +102,24 @@ def rank(cfg, llm, query, results, limit=10):
     except (ProviderError, ValueError) as err:
         ui.warn("ranking skipped ({}); showing repository order".format(err))
         return [(d, "") for d in results[:limit]]
-    genes = [str(g).strip().upper() for g in (data.get("genes") or []) if re.match(r"^[A-Za-z0-9.-]{1,20}$", str(g))]
+    named = data.get("genes") if isinstance(data.get("genes"), list) else []
+    genes = [str(g).strip().upper() for g in named if re.match(r"^[A-Za-z0-9.-]{1,20}$", str(g))]
     rank.last_genes = genes[:2]
     by_acc = {d.accession: d for d in results}
-    out = [(by_acc[r["accession"]], r.get("why", "")) for r in data.get("ranked", []) if r.get("accession") in by_acc]
+    out = []
+    for r in data.get("ranked") if isinstance(data.get("ranked"), list) else []:
+        if isinstance(r, str):  # a bare accession where {"accession": ..., "why": ...} was asked for
+            r = {"accession": r}
+        if isinstance(r, dict) and isinstance(r.get("accession"), str) and r["accession"] in by_acc:
+            out.append((by_acc[r["accession"]], str(r.get("why") or "")))
     seen, ordered = set(), []
     for d, why in out:
         if d.accession not in seen:
             seen.add(d.accession)
             ordered.append((d, why))
+    # The studies the AI itself put in order. The ones below were shown to it and left out; their place in the
+    # list returned here is the repository's, not a rank (a batch remembers only the AI's order).
+    rank.ai_listed = [d.accession for d, _why in ordered]
     for d in results:  # keep the rest as fallbacks so a batch can look further down
         if d.accession not in seen:
             seen.add(d.accession)
@@ -364,7 +379,7 @@ def run_build(cfg, args, accession, llm=None, ds=None, publish_key=None, link_la
                       "No working conversion after {} attempts. That is a limit of this agent, not proof the "
                       "dataset can't be converted. Last problem:\n{}".format(cfg.attempts, str(err)[-1500:]))
     except ProviderError as err:
-        return finish(work, receipt, "AI_PROVIDER_" + err.kind.upper(), str(err) + " (an OpenAI problem, not the dataset)")
+        return finish(work, receipt, "AI_PROVIDER_" + err.kind.upper(), str(err) + " (an AI-provider problem, not the dataset)")
     clock.lap("conversion (built-in, no AI)" if attempts == 0 else "conversion (AI, {} attempt{})".format(
         attempts, "" if attempts == 1 else "s"))
     s = result.stats
@@ -489,6 +504,168 @@ def published_under_key(cfg, key):
     return out
 
 
+def search_id(query):
+    """Two searches are the same search when their words are: capitals and spacing do not matter.
+
+    Everything else does. "ER+ breast cancer" and "ER- breast cancer" are different questions.
+    """
+    return " ".join(str(query or "").lower().split())
+
+
+def slot_in(saved, fresh, listed=None):
+    """The remembered ranking, with the studies it has not seen put in where today's ranking has them.
+
+    saved:  accessions best first, as this search ranked them before.
+    fresh:  today's order of the studies the search returned today: the ones the AI ranked, then the rest.
+    listed: the ones the AI ranked today (default: all of `fresh`).
+    Nothing in `saved` moves, so asking for the same thing again never reshuffles a page. A study that is not in
+    `saved` goes in at the rank the AI gave it today: 4th in `fresh` is 4th among today's studies in the result.
+    A new study the AI was shown and left out has no rank, so it goes last.
+    """
+    order, known, today = list(saved), set(saved), set(fresh)
+    ranked_today = today if listed is None else set(listed)
+    here = [a for a in order if a in today]  # ranked before and returned again, in their remembered order
+    last = []
+    for pos, acc in enumerate(fresh):
+        if acc in known:
+            continue
+        known.add(acc)
+        if acc not in ranked_today:
+            last.append(acc)
+        elif pos < len(here):
+            order.insert(order.index(here[pos]), acc)
+            here.insert(pos, acc)
+        else:
+            order.append(acc)
+            here.append(acc)
+    return order + last
+
+
+# Outcomes that are a limit's doing, not the dataset's, and the limit that decides each. The limit in force is kept
+# with the outcome, so the dataset is tried again once that limit lets more through.
+LIMIT_OUTCOMES = {"TOO_MANY_SAMPLES": "max_samples", "TOO_FEW_SAMPLES": "min_samples", "FILES_TOO_LARGE": "size"}
+
+
+def batch_limits(cfg, args):
+    """The limits that can turn a dataset away on their own, as this run has them."""
+    return {"min_samples": int(getattr(args, "min_samples", 0) or 0),
+            "max_samples": int(getattr(args, "max_samples", 0) or 0),
+            "size": [cfg.max_file_gb, cfg.max_total_gb, bool(getattr(args, "yes", False))]}
+
+
+def _loosened(name, then, now):
+    """True when a limit lets more through now than when it turned a dataset away."""
+    try:
+        if name == "max_samples":
+            return bool(then) and (not now or now > then)
+        if name == "min_samples":
+            return now < then
+        return bool(now[2] and not then[2]) or now[0] > then[0] or now[1] > then[1]
+    except (TypeError, IndexError, KeyError):
+        return False
+
+
+def failed_before(tried, acc, limits=None):
+    """The outcome that keeps a dataset this page already tried from being tried again, or None.
+
+    Anything that was tried and did not publish counts, whatever the reason: asking for the same thing again
+    must not spend minutes on the same dataset failing the same way (--retry-failed does that on request).
+    Two exceptions, because in both the dataset has not had its try: an OpenAI problem, and a limit that turned
+    the dataset away and has been loosened since (--max-samples raised, for one).
+    """
+    entry = tried.get(acc)
+    entry = entry if isinstance(entry, dict) else {}
+    status = str(entry.get("status") or "")
+    if not status or status == "published" or status.startswith("AI_PROVIDER_"):
+        return None
+    name = LIMIT_OUTCOMES.get(status)
+    if name and limits and "limit" in entry and _loosened(name, entry["limit"], limits[name]):
+        return None
+    return status
+
+
+def save_batch_state(path, state):
+    """The batch record, replaced in one step: a run that is cut off cannot leave half a file behind."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(str(tmp), str(path))
+
+
+def batch_ranking(cfg, llm, state, query, found, tried, limit, rerank=False):
+    """Accessions best first for this search, and the AI's reason for each: (order, why).
+
+    The ranking a search gets is remembered in the batch record, so asking for the same thing again gives the
+    same order and the best 10 stay the best 10. A study the search has not returned before is ranked by the AI
+    and goes in at the rank it gets (slot_in); nothing ranked earlier moves. When the search returns no such
+    study the AI is not asked at all. --rerank forgets the remembered ranking and takes the AI's order today.
+    """
+    sid = search_id(query)
+    rankings = state.get("rankings") if isinstance(state.get("rankings"), dict) else {}
+    memory = rankings.get(sid) if isinstance(rankings.get(sid), dict) else {}
+    saved = [str(a).upper() for a in memory.get("order") or []]
+    reasons = memory.get("why") if isinstance(memory.get("why"), dict) else {}
+    why = {str(a).upper(): str(r) for a, r in reasons.items()} if saved else {}
+    since = memory.get("ranked_at") or "the last run"
+    history = False
+    if not saved:
+        # No ranking is remembered for this search, but it may have tried datasets (a page made before rankings
+        # were remembered, or a run when the AI could not rank). The order it tried them in is the top of the
+        # ranking it had then, so they keep it. Datasets another search put on this page are not part of it.
+        saved = [acc for acc, entry in tried.items() if isinstance(entry, dict) and entry.get("search") == sid]
+        history = bool(saved)
+    known = set(saved)
+    pool = [d.accession.upper() for d in found[:limit]]  # the studies the AI is shown
+    new = [a for a in pool if a not in known]
+    rank.last_genes, rank.ai_listed = [], []
+    if saved and not new and not history and not rerank:
+        ui.info("{} already ranked ({}), so that ranking stands".format(
+            "every study this search returned was" if len(found) <= limit else
+            "the first {} studies this search returned were all".format(limit), since))
+        return saved, why
+    ranked = rank(cfg, llm, query, found, limit=limit)
+    # today's order: what the AI ranked of the studies it was shown, then the rest as the search gave them
+    listed = [a for a in dict.fromkeys(str(x).upper() for x in rank.ai_listed) if a in set(pool)]
+    fresh = listed + [a for a in pool if a not in set(listed)]
+    if not listed:
+        # The AI ranked nothing (it could not be reached, or its reply was no ranking). Repository order is not a
+        # ranking: nothing is remembered from it, and the studies that are new stay new for the next run. They
+        # go last here, because their place in a list nobody ranked means nothing.
+        if rerank and saved:
+            ui.warn("the AI did not rank, so --rerank changed nothing: the ranking this search already has is used")
+        return saved + [a for a in fresh if a not in known], why
+    if rerank:
+        order, why = fresh, {}
+    elif history:
+        order = saved + [a for a in fresh if a not in known]
+        ui.info("the datasets this search already tried keep the order they were tried in; the other studies "
+                "follow in today's ranking")
+    else:
+        order = slot_in(saved, fresh, listed)
+        if saved:
+            got, left = [a for a in new if a in set(listed)], [a for a in new if a not in set(listed)]
+
+            def names(items, show=str):
+                return ", ".join(show(a) for a in items[:6]) + (
+                    " and {} more".format(len(items) - 6) if len(items) > 6 else "")
+            text = "{} stud{} new to this search since {}.".format(
+                len(new), "y is" if len(new) == 1 else "ies are", since)
+            if got:
+                text += " The AI ranked {} among the {} it was shown: {}.".format(
+                    "it" if len(new) == 1 else len(got), len(pool),
+                    names(got, lambda a: "{} (#{})".format(a, fresh.index(a) + 1)))
+            if left:
+                text += " {} left {} out of its ranking, so {} last: {}.".format(
+                    "It" if got else "The AI", "it" if len(new) == 1 else len(left),
+                    "it goes" if len(left) == 1 else "they go", names(left))
+            ui.info(text)
+    for d, reason in ranked:
+        if reason:
+            why.setdefault(d.accession.upper(), str(reason)[:200])  # a study keeps the reason it was first ranked for
+    rankings[sid] = {"query": query, "order": order, "why": why, "ranked_at": time.strftime("%Y-%m-%d")}
+    state["rankings"] = rankings
+    return order, why
+
+
 def cmd_batch(cfg, args):
     key = args.key.strip()
     if not re.match(r"^[A-Za-z0-9._+-]+$", key):
@@ -498,19 +675,41 @@ def cmd_batch(cfg, args):
             raise SystemExit("--{} applies to one dataset, so it cannot be used with batch.".format(bad))
     args.no_publish = False  # a batch publishes as it goes, so partial progress is usable
     state_path = batch_state_path(cfg, key)
-    state = json.loads(state_path.read_text()) if state_path.is_file() else {}
+    try:
+        state = json.loads(state_path.read_text()) if state_path.is_file() else {}
+        if not isinstance(state, dict):
+            raise ValueError("it does not hold a record")
+    except ValueError as err:
+        raise SystemExit("The batch record {} cannot be read ({}). Move it aside and run again: what is on the page "
+                         "is read from explore.conf, not from this file.".format(state_path, err))
     query = " ".join(args.query or []).strip() or state.get("query", "")
     if not query:
         raise SystemExit("Give a search query the first time you use a key: hegemon batch \"...\" --key " + key)
     want = int(args.count)
+    if want < 1:
+        raise SystemExit("--count must be 1 or more.")
     label = args.label or query
+    # Default: the page should hold the best `want` datasets for this search, so what is already there counts and
+    # only what is new gets built. --more: add the next `want` down the ranking, whatever is already there.
+    more, retry = bool(getattr(args, "more", False)), bool(getattr(args, "retry_failed", False))
+    sid, limits = search_id(query), batch_limits(cfg, args)
+    # the command that repeats this request, for the hints printed at the end
+    if getattr(args, "cmd", None) == "agent":
+        again = "hegemon agent" + ("" if key == key_from_query(query) else " --key " + key)
+    else:
+        again = "hegemon batch --key " + key
+    count = "" if want == 10 else " --count {}".format(want)
 
     ui.step("Batch '{}': {} dataset(s) for: {}".format(key, want, query))
     already = published_under_key(cfg, key)
     if already:
         ui.info("{} dataset(s) already published under '{}': {}".format(len(already), key, ", ".join(sorted(already))))
-        ui.info("This run adds {} more and skips those.".format(want))
+        ui.info("This run adds {} more and skips those.".format(want) if more else
+                "Those are skipped. This run adds only what is new in the best {} for this search.".format(want))
     tried = {a.upper(): v for a, v in (state.get("tried") or {}).items()}
+    for entry in tried.values():
+        if isinstance(entry, dict):  # a record from before 1.1 does not say which search tried a dataset:
+            entry.setdefault("search", search_id(state.get("query")))  # it was the one search the record names
 
     llm = get_llm(cfg)
     ui.step("Searching GEO and ArrayExpress")
@@ -538,35 +737,86 @@ def cmd_batch(cfg, args):
     if not found:
         ui.fail("Nothing left with at least {} samples. Lower --min-samples or change the query.".format(min_samples))
         return 1
-    rank.last_genes = []
-    ranked = rank(cfg, llm, query, found, limit=max(60, want * 6))
+    limit = max(60, want * 6)
+    order, why = batch_ranking(cfg, llm, state, query, found, tried, limit, rerank=bool(getattr(args, "rerank", False)))
+    pool = {d.accession.upper(): d for d in found[:limit]}  # the studies the ranking was about
     genes = [g.strip().upper() for g in (args.genes or "").split(",") if g.strip()][:2] or \
         rank.last_genes or state.get("genes") or []
     if genes:
         state["genes"] = genes
         ui.info("page opens on {} vs {} when both are in every dataset (--genes A,B to change)".format(*genes)
                 if len(genes) == 2 else "")
-    queue = [(d, why) for d, why in ranked if d.accession.upper() not in already]
-    ui.info("{} ranked candidates, {} to try".format(len(ranked), len(queue)))
 
-    published, failed, url = [], [], None
-    for dataset, why in queue:
-        if len(published) >= want:
+    def standing(acc):
+        """Where a ranked study stands for this page: published, gone, failed or new."""
+        if acc in already:
+            return "published"   # explore.conf says so: the source of truth
+        if acc not in pool:
+            return "gone"        # ranked on an earlier run; the search did not return it today
+        if failed_before(tried, acc, limits) and not retry:
+            return "failed"
+        return "new"
+
+    def outcome(result, dataset):
+        """What the batch record keeps about one try."""
+        status = result.get("status")
+        entry = {"status": status, "detail": str(result.get("detail", ""))[:400], "work": result.get("work", ""),
+                 "at": time.strftime("%Y-%m-%d %H:%M:%S"), "title": dataset.title, "search": sid}
+        if status in LIMIT_OUTCOMES:
+            entry["limit"] = limits[LIMIT_OUTCOMES[status]]
+        return entry
+
+    # The plan, before anything is built: walk down the ranking until `want` places are taken.
+    on_page, to_add, skipped = [], [], []
+    for acc in order:
+        if len(on_page) + len(to_add) >= want:
             break
-        acc = dataset.accession.upper()
-        note = tried.get(acc, {}).get("status")
-        if note in REASON_TEXT and not args.retry_failed:
-            ui.info("skipping {} ({} last time; --retry-failed to try again)".format(acc, note))
+        what = standing(acc)
+        if what == "published" and not more:
+            on_page.append(acc)
+        elif what == "failed":
+            skipped.append(acc)
+        elif what == "new":
+            to_add.append(acc)
+    if more:
+        ui.info("the next {} down the ranking: {}{}".format(
+            len(to_add), ", ".join(to_add) or "nothing left",
+            " (all the ranking has left)" if 0 < len(to_add) < want else ""))
+    elif already or skipped:
+        ui.info("the best {} for this search: {} already on your page, {} to add{}".format(
+            want, len(on_page), len(to_add), ": " + ", ".join(to_add) if to_add else ""))
+    else:
+        ui.info("{} ranked candidates, {} to try".format(
+            len(pool), sum(1 for acc in order if standing(acc) == "new")))
+    state.update(key=key, query=query, label=label, tried=tried, updated_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    save_batch_state(state_path, state)  # the ranking is kept even when nothing gets built
+
+    # `filled` counts places taken in the best `want`; `goal` is how many of them this run has to add.
+    published, failed, url, filled, attempted, goal = [], [], None, 0, set(), len(to_add)
+    for acc in (order if to_add else []):
+        if filled >= want:
+            break
+        what = standing(acc)
+        if what == "published":
+            filled += 0 if more else 1
             continue
+        if what == "gone":
+            continue
+        if what == "failed":
+            ui.info("skipping {} ({} last time; --retry-failed to try again)".format(
+                acc, failed_before(tried, acc, limits)))
+            continue
+        dataset = pool[acc]
+        attempted.add(acc)
         size = "{} samples, ".format(dataset.n_samples) if dataset.n_samples else ""
-        ui.step("[{}/{}] {}  {}{}".format(len(published) + 1, want, acc, size, dataset.title[:80]))
-        if why:
-            ui.info("ranked because: " + why)
+        ui.step("[{}/{}] {}  {}{}".format(len(published) + 1, goal, acc, size, dataset.title[:80]))
+        if why.get(acc):
+            ui.info("ranked because: " + str(why[acc]))
         try:
             result = run_build(cfg, args, acc, llm, dataset, publish_key=key, link_label=label, genes=genes)
         except ProviderError as err:
             ui.fail("Stopping the batch: " + str(err))
-            ui.info("This is an OpenAI problem, not a dataset problem. Nothing published so far is affected.")
+            ui.info("This is an AI-provider problem, not a dataset problem. Nothing published so far is affected.")
             break
         except KeyboardInterrupt:
             raise
@@ -574,48 +824,253 @@ def cmd_batch(cfg, args):
             result = {"status": "AGENT_ERROR", "detail": repr(err), "work": "", "code": 2}
             ui.fail("unexpected agent error on {}: {!r}".format(acc, err))
         status = result.get("status")
+        tried[acc] = outcome(result, dataset)
         if str(status).startswith("AI_PROVIDER_"):
             ui.fail("Stopping the batch: " + str(result.get("detail", status)))
-            ui.info("This is an OpenAI problem, not a dataset problem. Anything already published is unaffected.")
-            tried[acc] = {"status": status, "detail": str(result.get("detail", ""))[:400],
-                          "work": result.get("work", ""), "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                          "title": dataset.title}
-            state.update(key=key, query=query, label=label, tried=tried,
-                         updated_at=time.strftime("%Y-%m-%d %H:%M:%S"))
-            state_path.write_text(json.dumps(state, indent=2))
-            break
-        tried[acc] = {"status": status, "detail": str(result.get("detail", ""))[:400],
-                      "work": result.get("work", ""), "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                      "title": dataset.title}
-        if status == "published":
+            ui.info("This is an AI-provider problem, not a dataset problem. Anything already published is unaffected.")
+        elif status == "published":
             published.append((acc, result["receipt"]))
+            filled += 1
             url = result.get("url") or url
-            ui.ok("{} of {} published under '{}'".format(len(published), want, key))
+            ui.ok("{} of {} published under '{}'".format(len(published), goal, key))
         else:
             failed.append((acc, status, str(result.get("detail", ""))[:200]))
         state.update(key=key, query=query, label=label, tried=tried,
                      updated_at=time.strftime("%Y-%m-%d %H:%M:%S"))
-        state_path.write_text(json.dumps(state, indent=2))
+        save_batch_state(state_path, state)
+        if str(status).startswith("AI_PROVIDER_"):
+            break
 
-    ui.step("Batch '{}' finished".format(key))
     total = published_under_key(cfg, key)
-    for acc, receipt in published:
-        groups = "; ".join("{}: {}".format(c, g) for c, g in (receipt.get("groups") or [])[:2])
-        took = ui.duration((receipt.get("timing") or {}).get("total", 0))
-        ui.ok("{}  {} samples x {} probes | {} | {}".format(acc, receipt["samples"], receipt["probes"], took, groups))
-    if failed:
-        ui.info("Not published this run:")
-        for acc, status, detail in failed:
-            ui.info("  {}: {} - {}".format(acc, status, detail))
-    if total:
-        link = url or "{}/explore.php?key={}".format(cfg.site_url, key)
-        ui.step("{} dataset(s) are now on one page under key '{}'".format(len(total), key))
-        ui.info(link)
-        ui.info("Run the same command again to add the next {}: hegemon batch --key {}".format(want, key))
+    link = url or "{}/explore.php?key={}".format(cfg.site_url, key)
+    further = [acc for acc in order if acc not in attempted and standing(acc) == "new"]  # not looked at yet
+    # only the first `limit` studies a search returns are ranked; say so where "nothing is left" would mislead
+    beyond = ("The ranking covers the first {} of the {} studies the search returned; a larger --count ranks "
+              "more of them.".format(limit, len(found)) if len(found) > limit else "")
+    if to_add:
+        ui.step("Batch '{}' finished".format(key))
+        for acc, receipt in published:
+            groups = "; ".join("{}: {}".format(c, g) for c, g in (receipt.get("groups") or [])[:2])
+            took = ui.duration((receipt.get("timing") or {}).get("total", 0))
+            ui.ok("{}  {} samples x {} probes | {} | {}".format(acc, receipt["samples"], receipt["probes"], took, groups))
+        if failed:
+            ui.info("Not published this run:")
+            for acc, status, detail in failed:
+                ui.info("  {}: {} - {}".format(acc, status, detail))
+        if total:
+            ui.step("{} dataset(s) are now on one page under key '{}'".format(len(total), key))
+            ui.info(link)
+            if not more:
+                ui.info("Ask for the same thing again and only what is new in the best {} is added.".format(want))
     else:
+        # Nothing was built: say so plainly, and say why.
+        ui.step("Nothing new for '{}'".format(key))
+        if more:
+            ui.info("There is nothing further down the ranking for \"{}\": every study in it is on your page or "
+                    "did not publish before.".format(query))
+        elif len(on_page) >= want:
+            ui.ok("The best {} datasets for \"{}\" are already on your page. Nothing was added.".format(want, query))
+        elif on_page:
+            ui.ok("All {} datasets this ranking can give you are already on your page. Nothing was added.".format(
+                len(on_page)))
+        if beyond and (more or len(on_page) < want):
+            ui.info(beyond)
+        if skipped:
+            ui.info("{} that did not publish before {} left alone: {}{}".format(
+                len(skipped), "was" if len(skipped) == 1 else "were",
+                ", ".join("{} ({})".format(acc, failed_before(tried, acc, limits)) for acc in skipped[:8]),
+                " and {} more".format(len(skipped) - 8) if len(skipped) > 8 else ""))
+            ui.info("To try {} again: {}{}{} --retry-failed".format(
+                "it" if len(skipped) == 1 else "them", again, " --more" if more else "", count))
+        if total:
+            ui.info("Your page ({} dataset{}): {}".format(len(total), "" if len(total) == 1 else "s", link))
+    if further and total and more:
+        ui.info("For the {} after these: {} --more{}".format(want, again, count))
+    elif further and total:
+        ui.info("For the next {} down the ranking: {} --more{}".format(want, again, count))
+    if not total:
         ui.fail("Nothing was published under '{}'.".format(key))
     ui.info("Batch record: " + str(state_path))
-    return 0 if published else 1
+    if more:
+        return 0 if published else 1
+    # the page holds the best it can for this search, whether this run added to it or found nothing new
+    return 0 if published or filled >= want or (not to_add and on_page) else 1
+
+
+_KEY_SKIP = {"a", "an", "and", "the", "of", "in", "on", "for", "to", "with", "from", "by", "or", "at", "vs",
+             "versus", "dataset", "datasets", "data", "study", "studies"}
+
+
+def key_from_query(query, limit=24):
+    """The page key for a search typed into `hegemon agent`: its words run together, e.g.
+    'psoriasis lesional skin' -> psoriasislesionalskin. The same words always give the same page."""
+    words = re.findall(r"[a-z0-9]+", query.lower())
+    words = [w for w in words if w not in _KEY_SKIP] or words
+    key = ""
+    for word in words:
+        if key and len(key) + len(word) > limit:
+            break
+        key += word
+    return key[:limit] or "datasets" + time.strftime("%m%d%H%M")
+
+
+def cmd_agent(cfg, args):
+    """`hegemon agent`: ask what to look for, then run the same 10-dataset batch as `hegemon batch`.
+
+    This only changes how a batch is started. Everything after the question is cmd_batch.
+    """
+    if not ready_mode(cfg):
+        return 1
+    query = " ".join(args.query or []).strip()
+    if not query:
+        print()
+        query = ui.ask("What datasets do you want to look for? ")
+        if not query:
+            ui.info("Type a topic, for example: psoriasis lesional skin")
+            query = ui.ask("What datasets do you want to look for? ")
+    query = query.strip().strip("\"'").strip()
+    if not query:
+        ui.fail("Nothing was typed, so nothing was started.")
+        return 1
+    args.query = [query]
+    if not args.key:
+        args.key = key_from_query(query)
+    ui.info("Your page: {}/explore.php?key={}".format(cfg.site_url, args.key))
+    return cmd_batch(cfg, args)
+
+
+def choose_mode(cfg):
+    """Ask local / mixed / cloud and save the answer. Returns False if nothing usable was chosen."""
+    print()
+    ui.info("Where should the AI run?")
+    for i, m in enumerate(MODES, 1):
+        ui.info("  {}. {}".format(i, MODE_TEXT[m]))
+    current = cfg.mode or "cloud"
+    answer = ui.ask("Type 1, 2 or 3 [{}]: ".format(MODES.index(current) + 1)).strip().lower()
+    pick = {"1": "cloud", "2": "local", "3": "mixed"}.get(answer, answer if answer in MODES else current)
+    settings = load_settings()
+    cfg.mode = pick
+    cfg.apply_mode()
+    if pick != "cloud" and not setup_local(cfg, settings):
+        return False
+    settings["mode"] = cfg.mode
+    save_settings(settings)
+    ui.ok("saved: {} (change it any time with: hegemon mode)".format(MODE_TEXT[cfg.mode]))
+    return True
+
+
+def setup_local(cfg, settings):
+    """Make sure the local model answers; ask for its address and name until it does, or switch to cloud."""
+    llm = LLM(None, cfg)
+    while True:
+        try:
+            ui.info("testing {} at {} ...".format(cfg.local_model, cfg.local_url))
+            llm.ping(cfg.local_model)
+            ui.ok("the local model answered")
+            settings.update(local_url=cfg.local_url, local_model=cfg.local_model)
+            return True
+        except ProviderError as err:
+            ui.fail(str(err))
+        if not sys.stdin.isatty():
+            return False
+        ui.info("The server reaches your laptop's Ollama only through the ssh tunnel. Log in with:")
+        ui.info("  ssh -R 11434:127.0.0.1:11434 {}@hegemon.ucsd.edu".format(cfg.user))
+        ui.info("and keep Ollama running on the laptop (check there with: curl http://127.0.0.1:11434/v1/models).")
+        choice = ui.ask("Enter to try again, a new address or model name to change it, or 'cloud' to use OpenAI: ")
+        choice = choice.strip()
+        if choice.lower() == "cloud":
+            cfg.mode = "cloud"
+            cfg.apply_mode()
+            return True
+        if choice.startswith("http"):
+            cfg.local_url = choice.rstrip("/")
+        elif choice:
+            cfg.local_model = choice
+        cfg.apply_mode()
+
+
+def ready_mode(cfg):
+    """Before a run: ask the mode the first time (then remember it); for local/mixed, check the model answers."""
+    if not sys.stdin.isatty():
+        return True                     # scripts and tests: the saved mode, or cloud as before
+    if cfg.mode is None:
+        return choose_mode(cfg)
+    ui.info("AI: {} (change with: hegemon mode)".format(MODE_TEXT[cfg.mode]))
+    if cfg.mode == "cloud":
+        return True
+    settings = load_settings()
+    if not setup_local(cfg, settings):
+        return False
+    if cfg.mode == "cloud":             # switched to cloud during setup
+        settings["mode"] = "cloud"
+    save_settings(settings)
+    return True
+
+
+def cmd_mode(cfg, args):
+    return 0 if choose_mode(cfg) else 1
+
+
+SHELL_LINE = ('[ -n "$BASH_VERSION$ZSH_VERSION" ] && [ -f "$HOME/.hegemon-agent-commands.sh" ] && '
+              '. "$HOME/.hegemon-agent-commands.sh"  # hegemon-agent command')
+
+
+def cmd_install(cfg, args):
+    """Make `hegemon` a command in your shell, so `hegemon agent` works straight after ssh. Run once."""
+    import shlex
+    import subprocess
+    launcher = Path(os.path.abspath(__file__)).parent / "hegemon"   # as you reach it, not through symlinks
+    home = Path.home()
+    try:
+        call = '"$HOME/{}"'.format(launcher.relative_to(home))
+    except ValueError:
+        call = shlex.quote(str(launcher))
+    snippet = home / ".hegemon-agent-commands.sh"
+    ui.step("Making `hegemon` a command for " + cfg.user)
+    try:
+        snippet.write_text(
+            "# Written by `hegemon install`. Gives your shell the commands `hegemon` and `hegemon-agent`.\n"
+            "unalias hegemon 2>/dev/null\n"
+            "hegemon() {{ bash {0} \"$@\"; }}\n"
+            "alias hegemon-agent='hegemon agent'\n".format(call))
+        shell = os.path.basename(os.environ.get("SHELL", "") or "bash")
+        login = next((home / n for n in (".bash_profile", ".bash_login", ".profile") if (home / n).is_file()),
+                     home / ".profile")
+        files = [home / ".bashrc", login]
+        if shell == "zsh" or (home / ".zshrc").is_file():
+            files.append(home / ".zshrc")
+        for rc in files:
+            text = rc.read_text(errors="replace") if rc.is_file() else ""
+            if "# hegemon-agent command" in text:
+                ui.info("{} already has it".format(rc))
+                continue
+            with open(str(rc), "a") as fh:
+                fh.write(("" if text.endswith("\n") or not text else "\n") + SHELL_LINE + "\n")
+            ui.info("added one line to {}".format(rc))
+    except OSError as err:
+        ui.fail("Could not write the shell setup ({}).".format(err))
+        ui.info("Start the agent with this instead: bash {} agent".format(launcher))
+        return 1
+    if shell not in ("bash", "zsh"):
+        ui.warn("Your login shell is {}, which this setup does not cover. Start the agent with: bash {} agent"
+                .format(shell, launcher))
+        return 1
+    # prove it in a brand-new login shell, the way the next ssh session starts
+    try:
+        probe = subprocess.run([shell, "-lic", "type hegemon"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, universal_newlines=True, timeout=30)
+        works = "function" in probe.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        works = False
+    if works:
+        ui.ok("a new login shell knows the command `hegemon`")
+    else:
+        ui.warn("could not confirm it in a new login shell; if `hegemon agent` says 'command not found' after you "
+                "log in again, start it with: bash {} agent".format(launcher))
+    ui.step("Done")
+    ui.info("Log out, ssh in again, and type:  hegemon agent")
+    ui.info("(to use it in this window right now:  source ~/.hegemon-agent-commands.sh)")
+    return 0
 
 
 def cmd_diagnose(cfg, args):
@@ -766,16 +1221,19 @@ def cmd_check(cfg, args):
         row("select dataset" in page.lower(), "Hegemon page", cfg.site_url + "/explore.php", hard=False)
     except net.NetError as err:
         row(False, "Hegemon page unreachable", err, hard=False)
-    key = load_key(cfg, prompt=False)
-    row(bool(key), "OpenAI API key", "found" if key else "missing: run hegemon key")
-    if key:
+    ui.info("mode: " + MODE_TEXT[cfg.mode or "cloud"] + ("" if cfg.mode else " -- not chosen yet; hegemon mode"))
+    key = load_key(cfg, prompt=False) if cfg.needs_key() else None
+    if cfg.needs_key():
+        row(bool(key), "OpenAI API key", "found" if key else "missing: run hegemon key")
+    if key or not cfg.needs_key():
         llm = LLM(key, cfg)
         for model in dict.fromkeys((cfg.model, cfg.fast_model)):
+            where = "Local model {} at {}".format(model, cfg.local_url) if cfg.is_local(model) else "OpenAI model " + model
             try:
                 llm.ping(model)
-                row(True, "OpenAI model " + model, "answered a test request")
+                row(True, where, "answered a test request")
             except ProviderError as err:
-                row(False, "OpenAI model " + model, err)
+                row(False, where, err)
     ui.step("Setup OK" if not problems else "Fix first: " + ", ".join(problems))
     return 0 if not problems else 1
 
@@ -801,6 +1259,19 @@ def main(argv=None):
                             "search/batch, no limit for build; 0 = no limit)")
         p.add_argument("--no-publish", action="store_true", help="build only")
 
+    def batch_opts(p):
+        p.add_argument("--count", type=int, default=10,
+                       help="how many of the best datasets for this search the page should hold (default 10); "
+                            "with --more, how many to add")
+        p.add_argument("--more", action="store_true",
+                       help="add the next --count datasets down the ranking, instead of only what is new in the "
+                            "best --count")
+        p.add_argument("--label", help="the text for the single homepage link (default: the query)")
+        p.add_argument("--retry-failed", action="store_true",
+                       help="also try again the datasets that did not publish in an earlier run")
+        p.add_argument("--rerank", action="store_true",
+                       help="forget the ranking remembered for this search and rank every study again")
+
     s = sub.add_parser("search", help="search, pick, build, publish")
     s.add_argument("query", nargs="*")
     build_opts(s)
@@ -810,10 +1281,14 @@ def main(argv=None):
     ba = sub.add_parser("batch", help="process several datasets and put them all on one page (one shared key)")
     ba.add_argument("query", nargs="*", help="what to search for (optional when the key already exists)")
     ba.add_argument("--key", required=True, help="the Hegemon key all these datasets share, e.g. tregcd")
-    ba.add_argument("--count", type=int, default=10, help="how many to publish in this run (default 10)")
-    ba.add_argument("--label", help="the text for the single homepage link (default: the query)")
-    ba.add_argument("--retry-failed", action="store_true", help="also retry datasets that failed before")
+    batch_opts(ba)
     build_opts(ba)
+    ag = sub.add_parser("agent", help="ask what to look for, then put the 10 best datasets on one Hegemon page")
+    ag.add_argument("query", nargs="*", help="what to search for (asked when left out)")
+    ag.add_argument("--key", help="the Hegemon key for the page (default: made from the words you type)")
+    batch_opts(ag)
+    build_opts(ag)
+    sub.add_parser("install", help="make `hegemon` a command in your shell (run once)")
 
     p = sub.add_parser("publish", help="publish a finished build folder")
     p.add_argument("build")
@@ -836,20 +1311,22 @@ def main(argv=None):
     up.add_argument("--key", help="take off every dataset under this key")
     up.add_argument("--yes", action="store_true", help="do not ask for confirmation")
 
-    sub.add_parser("check", help="check setup, OpenAI key and model")
+    sub.add_parser("mode", help="choose local, mixed or cloud models")
+    sub.add_parser("check", help="check setup and the AI model(s)")
     sub.add_parser("key", help="save the OpenAI API key")
     args = parser.parse_args(argv)
     if getattr(args, "min_samples", None) is None:
-        args.min_samples = 20 if args.cmd in ("search", "batch", None) else 0
+        args.min_samples = 20 if args.cmd in ("search", "batch", "agent", None) else 0
     if getattr(args, "max_samples", None) is None:
-        args.max_samples = 250 if args.cmd in ("search", "batch", None) else 0
+        args.max_samples = 250 if args.cmd in ("search", "batch", "agent", None) else 0
     cfg = Config()
     if getattr(args, "attempts", None):
         cfg.attempts = args.attempts
     try:
         if args.cmd == "build":
             return cmd_build(cfg, args)
-        return {"search": cmd_search, None: cmd_search, "batch": cmd_batch, "publish": cmd_publish,
+        return {"search": cmd_search, None: cmd_search, "batch": cmd_batch, "agent": cmd_agent, "mode": cmd_mode,
+                "install": cmd_install, "publish": cmd_publish,
                 "compare": cmd_compare, "check": cmd_check, "key": cmd_key,
                 "diagnose": cmd_diagnose, "unpublish": cmd_unpublish, "relink": cmd_relink}[args.cmd](cfg, args)
     except KeyboardInterrupt:
