@@ -98,6 +98,7 @@ class Config(object):
         self.reasoning = (os.environ.get("HEGEMON_REASONING") or "").strip() or None  # None: medium, then high
         self.ai_timeout = _num("HEGEMON_AI_TIMEOUT", 900)
         self.attempts = int(_num("HEGEMON_ATTEMPTS", 5))
+        self.high_effort_after = int(_num("HEGEMON_HIGH_AFTER", 2))  # failed attempts before reasoning goes high
 
         self.max_file_gb = _num("HEGEMON_MAX_FILE_GB", 5)
         self.max_total_gb = _num("HEGEMON_MAX_TOTAL_GB", 20)

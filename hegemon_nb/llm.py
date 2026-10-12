@@ -99,6 +99,8 @@ class LLM(object):
         self.calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        self.cached_tokens = 0      # input tokens OpenAI served from its prompt cache (billed at a discount)
+        self.reasoning_tokens = 0   # part of output_tokens: hidden thinking, billed as output
 
     def _post(self, payload, timeout):
         data = json.dumps(payload).encode("utf-8")
@@ -171,7 +173,9 @@ class LLM(object):
         return result
 
     def ask(self, instructions, text, model=None, effort=None, max_output_tokens=32000,
-            timeout=None, label="AI"):
+            timeout=None, label="AI", cache_key=None):
+        """cache_key: calls that share the same instructions should share a key, so OpenAI routes them to
+        the same prompt cache and bills the repeated prefix at the cached rate."""
         if self.cfg.is_local(model or self.cfg.model):
             return self._ask_local(instructions, text, model or self.cfg.model, max_output_tokens, timeout, label)
         payload = {
@@ -183,6 +187,8 @@ class LLM(object):
         effort = self.cfg.reasoning if effort is None else effort
         if effort:
             payload["reasoning"] = {"effort": effort}
+        if cache_key:
+            payload["prompt_cache_key"] = cache_key
         timeout = timeout or self.cfg.ai_timeout
         retried = False
         while True:
@@ -195,6 +201,10 @@ class LLM(object):
                     ui.warn("model does not take a reasoning setting; retrying without it")
                     payload.pop("reasoning")
                     continue
+                if err.kind == "bad_request" and "prompt_cache_key" in str(err) and "prompt_cache_key" in payload:
+                    ui.warn("endpoint does not take a prompt_cache_key; retrying without it")
+                    payload.pop("prompt_cache_key")
+                    continue
                 if err.kind in ("rate", "server") and not retried:
                     retried = True
                     ui.warn(str(err) + " -- retrying once in 20s")
@@ -205,6 +215,10 @@ class LLM(object):
         usage = data.get("usage") or {}
         self.input_tokens += int(usage.get("input_tokens") or 0)
         self.output_tokens += int(usage.get("output_tokens") or 0)
+        cached = int((usage.get("input_tokens_details") or {}).get("cached_tokens") or 0)
+        thinking = int((usage.get("output_tokens_details") or {}).get("reasoning_tokens") or 0)
+        self.cached_tokens += cached
+        self.reasoning_tokens += thinking
         text_out = []
         for item in data.get("output") or []:
             if item.get("type") == "message":
@@ -212,8 +226,8 @@ class LLM(object):
                     if part.get("type") in ("output_text", "text"):
                         text_out.append(part.get("text") or "")
         result = "".join(text_out).strip()
-        ui.info("{} answered in {:.0f}s ({} in / {} out tokens)".format(
-            label, hb.elapsed, usage.get("input_tokens", "?"), usage.get("output_tokens", "?")))
+        ui.info("{} answered in {:.0f}s ({} in, {} cached / {} out, {} reasoning tokens)".format(
+            label, hb.elapsed, usage.get("input_tokens", "?"), cached, usage.get("output_tokens", "?"), thinking))
         if data.get("status") == "incomplete" and not result:
             reason = (data.get("incomplete_details") or {}).get("reason", "unknown")
             raise ProviderError("incomplete", "OpenAI stopped before answering (reason: {}).".format(reason))

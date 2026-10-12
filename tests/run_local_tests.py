@@ -371,7 +371,7 @@ def _reply(script):
 def t_ai_repair_loop():
     good = (HERE / "fixture_geo_convert.py").read_text()
     broken = good.replace('gse.gpls[platform]', 'gse.gpls["GPL000"]')
-    ai = _mock([{"text": _reply(broken)}, {"text": _reply(good)}])
+    ai = _mock([{"text": _reply(broken)}, {"text": _reply(broken)}, {"text": _reply(good)}])
     try:
         rc, out = cli("build", "GSE999001", "--source", str(T / "fixtures" / "geo"), "--no-publish",
                       HEGEMON_BUILTIN="0")
@@ -379,17 +379,24 @@ def t_ai_repair_loop():
         stop(ai)
     assert rc == 0, out
     calls = [json.loads(l) for l in (T / "ai-log.jsonl").read_text().splitlines()]
-    assert len(calls) == 2, len(calls)
-    first, second = calls[0]["body"], calls[1]["body"]
-    assert first["reasoning"]["effort"] == "medium" and second["reasoning"]["effort"] == "high", \
-        (first.get("reasoning"), second.get("reasoning"))
+    assert len(calls) == 3, len(calls)
+    first, second, third = calls[0]["body"], calls[1]["body"], calls[2]["body"]
+    # One failure is usually a wrong key or column: still medium. High only after HEGEMON_HIGH_AFTER (2) failures.
+    assert [c["reasoning"]["effort"] for c in (first, second, third)] == ["medium", "medium", "high"], \
+        [c.get("reasoning") for c in (first, second, third)]
+    # A GEO build is shown the GEO notebook only, and every attempt shares one prompt-cache key.
     assert "BLUEPRINT: GSE51984-jupyter-process.txt" in first["instructions"]
-    assert "BLUEPRINT: E-MTAB-7604-make-Hegemon-files.txt" in first["instructions"]
+    assert "BLUEPRINT: E-MTAB-7604-make-Hegemon-files.txt" not in first["instructions"]
+    assert first["instructions"] == second["instructions"] == third["instructions"]
+    assert first["prompt_cache_key"] == second["prompt_cache_key"] == "hegemon-convert-GSE51984-jupyter-process"
     assert "GSM900003 -> Tumor: relapse 3" in first["input"]
     assert "WHAT WENT WRONG" in second["input"] and "KeyError: 'GPL000'" in second["input"], second["input"][-800:]
+    assert "Traceback (most recent call last)" in second["input"]
     assert calls[0]["auth"].startswith("Bearer sk-")
+    assert "600 cached" in out and "150 reasoning" in out, out[-1500:]
     receipt = json.loads((last_build("GSE999001-*") / "build.json").read_text())
-    assert receipt["attempts"] == 2 and receipt["ai_calls"] == 2
+    assert receipt["attempts"] == 3 and receipt["ai_calls"] == 3
+    assert receipt["ai_cached_tokens"] == 1800 and receipt["ai_reasoning_tokens"] == 450, receipt
 
 
 def t_ai_outcomes():

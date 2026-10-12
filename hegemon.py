@@ -229,7 +229,8 @@ def run_build(cfg, args, accession, llm=None, ds=None, publish_key=None, link_la
     receipt = {"agent_version": VERSION, "accession": accession, "repository": repo, "title": ds.title,
                "work": str(work), "started_at": time.strftime("%Y-%m-%d %H:%M:%S"), "model": cfg.model}
     clock = ui.Clock()
-    ai_start = (llm.calls, llm.input_tokens, llm.output_tokens) if llm else (0, 0, 0)
+    ai_start = (llm.calls, llm.input_tokens, llm.output_tokens, llm.cached_tokens, llm.reasoning_tokens) \
+        if llm else (0, 0, 0, 0, 0)
     ui.step("{}  {}".format(accession, ds.title))
     ui.info("build folder: " + str(work))
 
@@ -427,6 +428,8 @@ def run_build(cfg, args, accession, llm=None, ds=None, publish_key=None, link_la
                    attempts=attempts, script=str(work / "convert.py"), lab_script=str(cfg.lab_script),
                    lab_script_sha256=lab_hash, ai_calls=(llm.calls - ai_start[0]) if llm else 0,
                    ai_tokens=[llm.input_tokens - ai_start[1], llm.output_tokens - ai_start[2]] if llm else [0, 0],
+                   ai_cached_tokens=(llm.cached_tokens - ai_start[3]) if llm else 0,
+                   ai_reasoning_tokens=(llm.reasoning_tokens - ai_start[4]) if llm else 0,
                    sha256=native.file_hashes(run_dir, prefix), built_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     (work / "build.json").write_text(json.dumps(receipt, indent=2))
     ui.step("Built " + prefix)

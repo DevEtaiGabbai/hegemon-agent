@@ -19,7 +19,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = {"choices": [{"message": {"role": "assistant", "content": step["text"]}, "finish_reason": "stop"}],
                        "usage": {"prompt_tokens": step.get("prompt_tokens", 1000), "completion_tokens": 200}}
         else:
-            payload = {"status": "completed", "usage": {"input_tokens": 1000, "output_tokens": 200},
+            payload = {"status": "completed", "usage": {"input_tokens": 1000, "output_tokens": 200,
+                       "input_tokens_details": {"cached_tokens": 600}, "output_tokens_details": {"reasoning_tokens": 150}},
                        "output": [{"type": "reasoning"}, {"type": "message", "content": [{"type": "output_text", "text": step["text"]}]}]}
         data = json.dumps(payload).encode()
         self.send_response(step.get("status", 200))

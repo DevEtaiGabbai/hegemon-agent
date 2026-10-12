@@ -17,6 +17,8 @@ from .config import AGENT_DIR, BLUEPRINT_DIR
 REASONS = ("NO_PROCESSED_DATA", "NO_SAMPLE_MATCH", "NOT_EXPRESSION", "MISSING_FILES", "NO_GROUPING_METADATA",
            "NOT_HOSTED")
 MAX_FETCH_ROUNDS = 3
+# Which notebook each repository is shown. Anything else (a study on another site) gets both.
+BLUEPRINT_FOR = {"GEO": "GSE51984-jupyter-process.txt", "ArrayExpress": "E-MTAB-7604-make-Hegemon-files.txt"}
 
 
 class Unconvertible(Exception):
@@ -169,9 +171,14 @@ def installed_packages():
     return ", ".join(found)
 
 
-def blueprints():
+def blueprints(repository=None):
+    """The notebook for this repository only: the other one is ~3-18k characters the model does not need."""
+    paths = sorted(BLUEPRINT_DIR.glob("*.txt"))
+    wanted = BLUEPRINT_FOR.get(repository)
+    if wanted and (BLUEPRINT_DIR / wanted).is_file():
+        paths = [BLUEPRINT_DIR / wanted]
     parts = []
-    for path in sorted(BLUEPRINT_DIR.glob("*.txt")):
+    for path in paths:
         parts.append("\n=== BLUEPRINT: {} ===\n{}".format(path.name, path.read_text(errors="replace")))
     return "\n".join(parts)
 
@@ -212,6 +219,19 @@ def _fix_line_numbers(text, script_name):
         return "{}, line {}".format(m.group(1), max(1, int(m.group(2)) - PREAMBLE_LINES))
     return re.sub(r'(File "[^"]*{}")?, line (\d+)'.format(re.escape(script_name)),
                   lambda m: shift(m) if m.group(1) else m.group(0), text)
+
+
+def crash_text(output, keep=4000):
+    """The part of a crashed script's output that explains the crash: the last traceback and a little of
+    what was printed just before it, not the whole log."""
+    i = output.rfind("Traceback (most recent call last):")
+    if i < 0:
+        return output[-keep:]
+    tail = output[i:]
+    if len(tail) >= keep:
+        return "...\n" + tail[-keep:]
+    before = output[max(0, i - (keep - len(tail))):i]
+    return ("...\n" if len(before) < i else "") + before + tail
 
 
 def run_script(code, script_path, run_dir, source_dir, prefix, cfg, log_path):
@@ -299,7 +319,9 @@ def convert(ds, prefix, work, run_dir, source_dir, evidence_text, series_samples
     logs = work / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     instructions = (INSTRUCTIONS.replace("<<PACKAGES>>", installed_packages())
-                    .replace("<<GENOME>>", str(cfg.genome_dir)) + blueprints())
+                    .replace("<<GENOME>>", str(cfg.genome_dir)) + blueprints(ds.repository))
+    # Same instructions -> same key, so every attempt (and every build of this repository) reuses the cache.
+    cache_key = "hegemon-convert-{}".format(BLUEPRINT_FOR.get(ds.repository, "all")).replace(".txt", "")
     base = "PREFIX = {}\nSOURCE_DIR = {}\n\n{}".format(prefix, source_dir, evidence_text)
     genome_ok = any((cfg.genome_dir / n).is_file() for n in (
         "Homo_sapiens.GRCh38.94.chr_patch_hapl_scaff.t.txt", "Mus_musculus.GRCm38.94.chr_patch_hapl_scaff.t.txt"))
@@ -320,7 +342,7 @@ def convert(ds, prefix, work, run_dir, source_dir, evidence_text, series_samples
         if rc != 0:
             last = [l for l in output.strip().splitlines() if l.strip()][-1:] or ["(no output)"]
             ui.warn("script stopped ({}): {}".format(rc, last[0][:200]))
-            return "crashed", "The script stopped with exit status {}. Output:\n{}".format(rc, output)
+            return "crashed", "The script stopped with exit status {}. Output:\n{}".format(rc, crash_text(output))
         result = checks.check_core(run_dir, prefix, ds.repository, series_samples, genome_ok=genome_ok)
         if not result.ok:
             for err in result.errors:
@@ -363,7 +385,7 @@ def convert(ds, prefix, work, run_dir, source_dir, evidence_text, series_samples
             ui.info("the built-in conversion did not pass ({}); the AI takes over".format(verdict))
 
     explicit_effort = (os.environ.get("HEGEMON_REASONING") or "").strip() or None
-    attempt, fetch_rounds, hinted, why_again = 0, 0, False, ""
+    attempt, fetch_rounds, hinted, why_again, failures = 0, 0, False, "", 0
     while attempt < cfg.attempts:
         if script_file and attempt == 0:
             attempt += 1
@@ -383,9 +405,11 @@ def convert(ds, prefix, work, run_dir, source_dir, evidence_text, series_samples
                 text += "\n\n{}:\n{}\n\n{}".format(label, feedback[-9000:], (
                     "Fix the script for this same dataset and return the complete corrected script, or FETCH what "
                     "you need." if previous else "Write the conversion script now, or FETCH what you still need."))
-            # A first try at medium reasoning is about twice as fast; repairs think harder.
-            effort = explicit_effort or ("high" if failed_before else "medium")
-            reply = llm.ask(instructions, text, effort=effort, label="AI writing the conversion")
+            # Medium reasoning is about twice as fast and much cheaper. Most repairs are a wrong column or
+            # key, so think harder only once cfg.high_effort_after attempts have failed.
+            effort = explicit_effort or ("high" if failures >= cfg.high_effort_after else "medium")
+            reply = llm.ask(instructions, text, effort=effort, label="AI writing the conversion",
+                            cache_key=cache_key)
             (work / "ai-reply-{}.txt".format(attempt + fetch_rounds + 1)).write_text(reply)
             code, decisions, unconvertible = extract(reply)
             wanted = [] if code else parse_fetch(reply)
@@ -423,6 +447,7 @@ def convert(ds, prefix, work, run_dir, source_dir, evidence_text, series_samples
             if not code:
                 feedback = "Your reply contained no ```python block, no FETCH line and no valid UNCONVERTIBLE line."
                 failed_before = True
+                failures += 1
                 ui.warn(feedback)
                 continue
             for line in decisions:
@@ -431,6 +456,7 @@ def convert(ds, prefix, work, run_dir, source_dir, evidence_text, series_samples
         if verdict == "ok":
             return code, info[0], info[1], attempt
         failed_before = True
+        failures += 1
         if verdict == "groups":
             if llm is None or asked_for_groups:
                 raise Unconvertible("NO_GROUPING_METADATA", "no metadata column splits the samples into groups:\n" + info)

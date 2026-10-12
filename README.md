@@ -523,7 +523,8 @@ If a publish fails with "does not list the dataset" or "explore.php crashed", th
 | Variable | Default |
 |---|---|
 | `HEGEMON_MODEL` / `HEGEMON_FAST_MODEL` | `gpt-5.6-sol` / `gpt-5.6-luna` (the models V6 used) |
-| `HEGEMON_REASONING` | `medium` for the first attempt, `high` for repairs. Set it to force one level for every call. |
+| `HEGEMON_REASONING` | `medium` until `HEGEMON_HIGH_AFTER` attempts have failed, then `high`. Set it to force one level for every call. |
+| `HEGEMON_HIGH_AFTER` | `2`. Failed conversion attempts before reasoning goes from `medium` to `high`. |
 | `HEGEMON_BUILTIN=0` | always ask the AI, even for a GEO microarray the notebook's fixed cells can convert |
 | `HEGEMON_DOWNLOAD_PARTS` / `HEGEMON_DOWNLOAD_WORKERS` | `4` / `4`: byte ranges per large file, files at once. `1` turns each off. |
 | `HEGEMON_PARALLEL_WRITE_CELLS` | `4000000`: expr files with more values than this are written by up to 4 processes |
