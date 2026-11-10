@@ -445,13 +445,14 @@ def t_local_mode():
     old = dict(os.environ)
     try:
         os.environ.update(HEGEMON_LOCAL_MODEL="tiny-16k", HOME=str(T / "home-local"))
+        os.environ.pop("HEGEMON_MODEL", None)
         for mode, conv, fast in (("mixed", False, True), ("local", True, True), ("cloud", False, False)):
             os.environ["HEGEMON_MODE"] = mode
             c = Config()
             assert (c.is_local(c.model), c.is_local(c.fast_model)) == (conv, fast), mode
         os.environ.pop("HEGEMON_MODE")
         c = Config()
-        assert c.mode is None and c.model == "gpt-5.6-sol" and not c.is_local(c.fast_model)
+        assert c.mode is None and c.model == "gpt-6.1-sol" and not c.is_local(c.fast_model)
     finally:
         os.environ.clear()
         os.environ.update(old)

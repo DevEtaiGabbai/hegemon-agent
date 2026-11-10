@@ -4,13 +4,20 @@ Finds a public dataset (GEO or ArrayExpress) and turns it into a native Hegemon 
 
 ## Start here
 
+Install [Bun](https://bun.sh/docs/installation) and the terminal dependencies once on the machine where the agent runs:
+
+```sh
+cd ~/hegemon-agent
+bun install --no-save
+```
+
 After `ssh`, type:
 
 ```
-hegemon agent
+hegemon
 ```
 
-It asks **What datasets do you want to look for?** Type a topic and press Enter. From there it is the batch
+The OpenTUI research workstation opens. Press **0** to start the agent, or choose search, batch, build, and workspace tools with the numbered shortcuts. `hegemon agent` opens the same interface directly in an interactive terminal. It asks **What datasets do you want to look for?** Type a topic and press Enter. From there it is the batch
 described in the next section, with its default settings: it searches, ranks, and puts the 10 best datasets on
 one Hegemon page, and prints that page's address before it starts. The page's key is made from the words you
 type (`psoriasis lesional skin` becomes `psoriasislesionalskin`), so typing the same words another day goes to the
@@ -416,9 +423,9 @@ If every value is blank, publishing is refused and `explore.conf` and `index.htm
 build folder is kept so the cause can be found. `hegemon diagnose` runs the same checks on datasets that are
 already published.
 
-## Setup (nothing to install)
+## Setup
 
-It uses the Python 3.8 venv already in `~/hegemon-agent-v0/.venv` (pandas and numpy), and the OpenAI key already saved at `~/.config/hegemon-agent/openai.key`.
+The terminal interface requires Bun and `bun install --no-save` in this directory. It uses the Python 3.8 venv already in `~/hegemon-agent-v0/.venv` (pandas and numpy), and the OpenAI key already saved at `~/.config/hegemon-agent/openai.key`. Set `HEGEMON_PYTHON` to use another Python executable. With no terminal dependencies, the launcher falls back to the original Python CLI; scripts and piped invocations continue to use that CLI unchanged. Use `hegemon tui` to explicitly open the workstation, and `hegemon agent --help` for command options. Press Esc or Ctrl+C to stop a running workflow; partial files are kept.
 
 On your Mac:
 
@@ -453,7 +460,7 @@ Expected, deliberate differences:
 ## Daily use
 
 ```
-~/hegemon-agent/hegemon                                      # search, pick one from the menu, build, publish
+~/hegemon-agent/hegemon                                      # open the OpenTUI research workstation
 ~/hegemon-agent/hegemon batch "your topic" --key yourkey     # the best 10 datasets on one page
 ~/hegemon-agent/hegemon batch --key yourkey                  # the same search again: adds only what is new
 ~/hegemon-agent/hegemon batch --key yourkey --more           # the next 10 down the ranking
@@ -522,7 +529,7 @@ If a publish fails with "does not list the dataset" or "explore.php crashed", th
 
 | Variable | Default |
 |---|---|
-| `HEGEMON_MODEL` / `HEGEMON_FAST_MODEL` | `gpt-5.6-sol` / `gpt-5.6-luna` (the models V6 used) |
+| `HEGEMON_MODEL` / `HEGEMON_FAST_MODEL` | `gpt-6.1-sol` / `gpt-6.1-sol` (conversion and ranking/file selection, respectively) |
 | `HEGEMON_REASONING` | `medium` for the first attempt, `high` for repairs. Set it to force one level for every call. |
 | `HEGEMON_BUILTIN=0` | always ask the AI, even for a GEO microarray the notebook's fixed cells can convert |
 | `HEGEMON_DOWNLOAD_PARTS` / `HEGEMON_DOWNLOAD_WORKERS` | `4` / `4`: byte ranges per large file, files at once. `1` turns each off. |

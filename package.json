@@ -1,0 +1,19 @@
+{
+  "name": "hegemon-terminal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tui": "bun run tui/index.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.1.80",
+    "@opentui/react": "^0.1.80",
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.0.0"
+  }
+}

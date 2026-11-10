@@ -85,8 +85,8 @@ class Config(object):
                          or "http://hegemon.ucsd.edu/~{}/Hegemon".format(self.user)).rstrip("/")
 
         self.key_file = Path.home() / ".config" / "hegemon-agent" / "openai.key"  # same file V0-V6 used
-        self.model = os.environ.get("HEGEMON_MODEL", "gpt-5.6-sol")
-        self.fast_model = os.environ.get("HEGEMON_FAST_MODEL", "gpt-5.6-luna")
+        self.model = os.environ.get("HEGEMON_MODEL", "gpt-6.1-sol")
+        self.fast_model = os.environ.get("HEGEMON_FAST_MODEL", "gpt-6.1-sol")
         settings = load_settings()
         mode = (os.environ.get("HEGEMON_MODE") or settings.get("mode") or "").strip().lower()
         self.mode = mode if mode in MODES else None          # None: not chosen yet (cloud until it is)

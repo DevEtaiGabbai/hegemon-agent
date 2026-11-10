@@ -1,8 +1,26 @@
 #!/usr/bin/env bash
-# Runs the agent with the server's existing Python 3.8 venv. Nothing is installed.
+# Keep the Python CLI available for scripts; launch OpenTUI in interactive sessions.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 py="${HEGEMON_PYTHON:-$HOME/hegemon-agent-v0/.venv/bin/python}"
 [ -x "$py" ] || py="$(command -v python3)"
 unset PYTHONHOME PYTHONPATH
 export PYTHONNOUSERSITE=1
+
+explicit_tui=false
+if [ "${1:-}" = "tui" ]; then
+  explicit_tui=true
+  shift
+fi
+if $explicit_tui && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+  echo 'The OpenTUI interface needs an interactive terminal.' >&2
+  exit 1
+fi
+if [ -t 0 ] && [ -t 1 ] && { $explicit_tui || [ "$#" -eq 0 ] || { [ "${1:-}" = agent ] && [[ " $* " != *" --help "* ]] && [[ " $* " != *" -h "* ]]; }; }; then
+  if command -v bun >/dev/null 2>&1 && [ -d "$here/node_modules/@opentui/core" ] && [ -d "$here/node_modules/@opentui/react" ]; then
+    exec bun run "$here/tui/index.tsx" "$py" "$@"
+  fi
+  echo 'OpenTUI requires Bun and dependencies. Run: bun install --no-save (in the hegemon-agent directory).' >&2
+  if $explicit_tui; then exit 1; fi
+  echo 'Continuing with the original Python CLI.' >&2
+fi
 exec "$py" "$here/hegemon.py" "$@"
